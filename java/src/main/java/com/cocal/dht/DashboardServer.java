@@ -40,6 +40,8 @@ final class DashboardServer implements AutoCloseable {
       if (path.equals("/api/content")) { page(exchange, null); return; }
       if (path.equals("/api/search")) { page(exchange, query(exchange, "q", "")); return; }
       staticFile(exchange, path);
+    } catch (IllegalArgumentException error) {
+      json(exchange, 400, Map.of("error", error.getMessage()));
     } catch (Exception error) {
       json(exchange, 500, Map.of("error", error.getMessage() == null ? "internal error" : error.getMessage()));
     } finally { exchange.close(); }

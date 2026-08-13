@@ -71,6 +71,10 @@ unique resource discoveries and metadata outcomes remain individual events.
 cover more of the keyspace from one host. Open the full configured port range
 in the host and provider firewalls.
 
+The production metadata timeout is 45 seconds so the DHT peer lookup and BEP 9
+handshake can complete. Keep metadata concurrency bounded instead of reducing
+this timeout; short timeouts mostly turn live work into failed retries.
+
 ## Authorized Discovery And Indexing
 
 For an explicitly authorized release, the exact indexer remains available as a

@@ -258,7 +258,7 @@ function renderContent(items) {
   }
   $('#content-results').innerHTML = rows.map((item) => `<div class="content-row">
     <div class="content-row-main"><strong>${escapeHtml(item.name)}</strong><span class="mono">${escapeHtml(shortHash(item.info_hash))}</span></div>
-    <div class="content-row-meta"><span>${escapeHtml(item.variant)}</span><span>${formatBytes(item.total_size)}</span><span>${formatNumber(item.file_count)} files</span></div>
+    <div class="content-row-meta"><span>${escapeHtml(item.variant)}</span><span>${formatBytes(item.total_size)}</span><span>${formatNumber(item.file_count)} files</span><span>入库 ${escapeHtml(formatTime(item.created_at))}</span></div>
   </div>`).join('')
   renderPagination()
 }

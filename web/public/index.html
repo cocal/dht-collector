@@ -40,7 +40,7 @@
       </section>
 
       <section class="metric-grid" aria-label="探测摘要">
-        <article class="metric metric-lime"><span>探测事件</span><strong id="metric-probes">0</strong><small>已写入 SQLite</small></article>
+        <article class="metric metric-lime"><span>探测事件</span><strong id="metric-probes">0</strong><small>已写入 PostgreSQL</small></article>
         <article class="metric metric-teal"><span>Peer 发现</span><strong id="metric-peers">0</strong><small>去重前事件</small></article>
         <article class="metric metric-amber"><span>完成查询</span><strong id="metric-lookups">0</strong><small>lookup completed</small></article>
         <article class="metric metric-coral"><span>已索引内容</span><strong id="metric-content">0</strong><small id="metric-files">0 个文件条目</small></article>
@@ -114,7 +114,7 @@
           <div class="panel-heading"><div><p class="eyebrow">CATALOG</p><h2>已索引内容</h2></div><span class="count-chip" id="content-count">0</span></div>
           <form class="search-form" id="search-form">
             <label for="search-input">搜索内容</label>
-            <div class="search-line"><input id="search-input" name="q" type="search" placeholder="名称或文件路径" autocomplete="off"><button class="button button-primary" type="submit">搜索</button></div>
+            <div class="search-line"><input id="search-input" name="q" type="search" placeholder="名称或文件路径" minlength="3" maxlength="100" autocomplete="off"><button class="button button-primary" type="submit">搜索</button></div>
           </form>
           <div id="content-results" class="content-results"><div class="empty-state">暂无已验证内容</div></div>
           <nav class="pagination" id="search-pagination" aria-label="内容列表分页" hidden>
@@ -126,7 +126,7 @@
         <article class="status-panel">
           <div class="panel-heading"><div><p class="eyebrow">PIPELINE</p><h2>运行状态</h2></div><span class="status-badge"><i></i>本地</span></div>
           <dl class="status-list">
-            <div><dt>数据库</dt><dd>SQLite / FTS5</dd></div>
+            <div><dt>数据库</dt><dd>PostgreSQL / GIN</dd></div>
             <div><dt>采集层</dt><dd id="status-collector">等待事件</dd></div>
             <div><dt>元数据层</dt><dd id="status-metadata">等待结果</dd></div>
             <div><dt>自动刷新</dt><dd>8 秒</dd></div>
