@@ -1,12 +1,16 @@
 package com.cocal.dht;
 
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -27,6 +31,9 @@ import lbms.plugins.mldht.kad.messages.MessageBase;
 
 final class DhtCollector implements AutoCloseable {
   static final long CACHE_TTL_MS = Duration.ofHours(24).toMillis();
+  static final long ANNOUNCE_PEER_TTL_MS = Duration.ofMinutes(10).toMillis();
+
+  private record PeerHint(InetSocketAddress address, long observedAt) {}
 
   private final Config config;
   private final Catalog catalog;
@@ -38,6 +45,8 @@ final class DhtCollector implements AutoCloseable {
   private final Semaphore metadataPermits;
   private final MetadataFetcher metadata;
   private final Map<String, Instant> pendingTouches = new ConcurrentHashMap<>();
+  private final Map<String, Map<InetSocketAddress, PeerHint>> announcedPeers = new ConcurrentHashMap<>();
+  private final Map<String, Boolean> runningMetadata = new ConcurrentHashMap<>();
   private final Map<String, LongAdder> queryCounts = new ConcurrentHashMap<>();
   private final AtomicLong discovered;
   private volatile boolean stopping;
@@ -117,6 +126,17 @@ final class DhtCollector implements AutoCloseable {
     } else if (message instanceof AnnounceRequest request) {
       query = "announce_peer";
       infoHash = request.getInfoHash().toString(false).toLowerCase(Locale.ROOT);
+      InetSocketAddress origin = request.getOrigin();
+      int peerPort = request.getPort();
+      if (origin != null && peerPort > 0 && peerPort <= 65535) {
+        InetSocketAddress peer = new InetSocketAddress(origin.getAddress(), peerPort);
+        announcedPeers.compute(infoHash, (ignored, existing) -> {
+          Map<InetSocketAddress, PeerHint> peers = existing == null ? new LinkedHashMap<>() : new LinkedHashMap<>(existing);
+          peers.put(peer, new PeerHint(peer, System.currentTimeMillis()));
+          while (peers.size() > 3) peers.remove(peers.keySet().iterator().next());
+          return peers;
+        });
+      }
     } else {
       return;
     }
@@ -125,6 +145,7 @@ final class DhtCollector implements AutoCloseable {
     tasks.submit(() -> {
       try {
         acceptResource(infoHash, query);
+        if (query.equals("announce_peer")) startMetadataForAnnounce(infoHash);
       } catch (Exception error) {
         System.err.println("resource observation failed: " + error.getMessage());
       } finally {
@@ -171,20 +192,51 @@ final class DhtCollector implements AutoCloseable {
     int capacity = metadataPermits.availablePermits();
     if (capacity == 0) return;
     for (String infoHash : catalog.claimMetadataJobs(capacity, Instant.now())) {
+      if (!runningMetadata.putIfAbsent(infoHash, Boolean.TRUE)) continue;
       if (!metadataPermits.tryAcquire()) return;
       tasks.submit(() -> {
         try {
-          metadata.fetch(infoHash).toCompletableFuture()
+          Collection<InetSocketAddress> preferredPeers = currentAnnouncePeers(infoHash);
+          metadata.fetch(infoHash, preferredPeers).toCompletableFuture()
               .get(config.metadataTimeoutSeconds() + 5L, TimeUnit.SECONDS)
               .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
                   () -> completeMetadataFailure(infoHash, "no metadata result"));
         } catch (Exception error) {
           completeMetadataFailure(infoHash, error.getMessage());
         } finally {
+          runningMetadata.remove(infoHash);
           metadataPermits.release();
         }
       });
     }
+  }
+
+  private void startMetadataForAnnounce(String infoHash) {
+    if (!runningMetadata.putIfAbsent(infoHash, Boolean.TRUE)) return;
+    if (!metadataPermits.tryAcquire()) {
+      runningMetadata.remove(infoHash);
+      return;
+    }
+    tasks.submit(() -> {
+      try {
+        metadata.fetch(infoHash, currentAnnouncePeers(infoHash)).toCompletableFuture()
+            .get(config.metadataTimeoutSeconds() + 5L, TimeUnit.SECONDS)
+            .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
+                () -> completeMetadataFailure(infoHash, "no metadata result"));
+      } catch (Exception error) {
+        completeMetadataFailure(infoHash, error.getMessage());
+      } finally {
+        runningMetadata.remove(infoHash);
+        metadataPermits.release();
+      }
+    });
+  }
+
+  private Collection<InetSocketAddress> currentAnnouncePeers(String infoHash) {
+    long cutoff = System.currentTimeMillis() - ANNOUNCE_PEER_TTL_MS;
+    Map<InetSocketAddress, PeerHint> hints = announcedPeers.get(infoHash);
+    if (hints == null) return List.of();
+    return hints.values().stream().filter(hint -> hint.observedAt() >= cutoff).map(PeerHint::address).toList();
   }
 
   private void completeMetadataSuccess(String infoHash, Manifest manifest) {

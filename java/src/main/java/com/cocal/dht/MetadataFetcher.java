@@ -1,9 +1,11 @@
 package com.cocal.dht;
 
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -13,6 +15,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import lbms.plugins.mldht.kad.Key;
+import the8472.mldht.FetchTaskPeerHints;
 import the8472.mldht.TorrentFetcher;
 
 record Manifest(String infoHash, String variant, String name, long totalSize,
@@ -35,8 +38,17 @@ final class MetadataFetcher implements AutoCloseable {
   }
 
   CompletionStage<Optional<Manifest>> fetch(String infoHash) {
+    return fetch(infoHash, (Collection<InetSocketAddress>) null);
+  }
+
+  CompletionStage<Optional<Manifest>> fetch(String infoHash, InetSocketAddress preferredPeer) {
+    return fetch(infoHash, preferredPeer == null ? List.of() : List.of(preferredPeer));
+  }
+
+  CompletionStage<Optional<Manifest>> fetch(String infoHash, Collection<InetSocketAddress> preferredPeers) {
     Key key = new Key(infoHash);
-    var task = fetcher.fetch(key);
+    var task = preferredPeers == null || preferredPeers.isEmpty() ? fetcher.fetch(key)
+        : fetcher.fetch(key, fetchTask -> preferredPeers.forEach(peer -> FetchTaskPeerHints.add(fetchTask, peer)));
     activeTasks.add(task);
     CompletableFuture<Optional<Manifest>> result = new CompletableFuture<>();
     task.awaitCompletion().whenComplete((done, error) -> {
