@@ -1,0 +1,19 @@
+[Unit]
+Description=Passive Mainline DHT resource collector (Java)
+After=network-online.target dht-search-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/vibe/dht-collector/java
+EnvironmentFile=/etc/dht-search/db.env
+ExecStart=/usr/bin/java -XX:+UseG1GC -XX:MaxRAMPercentage=70 -jar /root/vibe/dht-collector/java/target/dht-collector-java-0.1.0.jar --address 0.0.0.0 --port 51413 --dht-nodes 12 --max-concurrent 160 --pool-size 5
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

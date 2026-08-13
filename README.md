@@ -114,6 +114,28 @@ The CLI binds an ephemeral UDP port by default. Use `--port` only when a
 stable port is required. Use `--no-peer-address` when output must omit peer
 endpoint details.
 
+## Java collector
+
+The passive collector also has a Java 21 implementation under `java/`. It uses
+mldht for the DHT protocol and routing table, virtual threads for observation
+work, and HikariCP for PostgreSQL pooling:
+
+```bash
+cd java
+mvn test
+mvn package
+java -jar target/dht-collector-java-0.1.0.jar --port 51413 --dht-nodes 12
+```
+
+The Java service uses the same `discovered_resource` and `probe_event` tables,
+so it can be introduced without a database migration. It covers passive DHT
+routing and resource observation. BEP9 metadata fetching and the authorized
+indexer remain in the existing Node.js tools until their Java worker is
+migrated separately. A generic unit template is in
+`deploy/dht-passive-collector-java.service`; adjust paths and the private
+environment-file location for the target host. Keep the current Node service
+running when metadata jobs must continue to execute.
+
 ## Event contract
 
 Events include `event_id`, `schema_version`, `event`, and `occurred_at` so they
