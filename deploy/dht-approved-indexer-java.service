@@ -1,0 +1,17 @@
+[Unit]
+Description=Authorized DHT indexer (Java, disabled by default)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/vibe/dht-collector
+EnvironmentFile=/etc/dht-search/db.env
+ExecStart=/usr/bin/java -Xms64m -Xmx512m -XX:+UseG1GC -jar /root/vibe/dht-collector/java/target/dht-collector-java-0.1.0.jar --mode approved-indexer --input /root/vibe/dht-collector/var/approved-infohashes.jsonl --port 51413 --interval-ms 300000 --lookup-timeout-ms 60000 --metadata-timeout-ms 12000 --metadata-concurrent 3 --pool-size 2
+TimeoutStartSec=0
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

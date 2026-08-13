@@ -7,11 +7,13 @@ import java.util.concurrent.ConcurrentHashMap;
 final class RecentResourceCache {
   private final long ttlMillis;
   private final Map<String, Long> observed = new ConcurrentHashMap<>();
+  RecentResourceCache(long ttlMillis) { this.ttlMillis = ttlMillis; }
   RecentResourceCache(long ttlMillis, Map<String, Instant> initial) {
-    this.ttlMillis = ttlMillis;
-    initial.forEach((hash, time) -> observed.put(hash, time.toEpochMilli()));
+    this(ttlMillis);
+    initial.forEach(this::load);
     prune(System.currentTimeMillis());
   }
+  void load(String hash, Instant time) { observed.put(hash, time.toEpochMilli()); }
   boolean contains(String hash, long now) {
     Long seen = observed.get(hash);
     if (seen == null) return false;

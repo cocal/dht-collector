@@ -1,37 +1,34 @@
 # DHT Collector 0.1
 
-This is the first runnable slice of DHT Search v2. It uses
-[`bittorrent-dht`](https://github.com/webtorrent/bittorrent-dht) to perform
-Mainline DHT discovery and emits versioned JSONL events. It deliberately does
-not download torrent payloads, announce a peer, write to the DHT, or expose a
-public search API.
+The production runtime is Java 21. One shaded jar provides passive Mainline
+DHT collection, BEP 9 metadata retrieval, PostgreSQL catalog access, the
+dashboard API/static UI, authorized indexing, JSONL catalog tools, and SQLite
+to PostgreSQL migration. It never downloads torrent payload pieces or writes
+to the DHT.
 
 ## Run
 
 ```bash
-npm install
-npm run check
+cd java
+mvn test
+mvn package
+export DATABASE_URL='postgresql://user:password@host/db' # keep secrets outside git
 
 # Confirm UDP bind and bootstrap behavior for five seconds.
-npm start -- health --duration-ms 5000
+java -jar target/dht-collector-java-0.1.0.jar --mode health --duration-ms 5000
 
-# Look up a known v1 infohash. The result is JSONL on stdout.
-npm start -- lookup <40-character-hex-infohash> --timeout-ms 30000
+# Look up a known v1 infohash and emit versioned JSONL events.
+java -jar target/dht-collector-java-0.1.0.jar --mode lookup \
+  --info-hash <40-character-hex-infohash> --timeout-ms 30000
 
-# Persist collector events and feed them into the metadata worker.
-node src/index.js lookup <40-character-hex-infohash> --event-log ./var/events.jsonl
-node src/metadata-fetcher.js --input ./var/events.jsonl --output ./var/metadata-events.jsonl
+# Ingest/search the PostgreSQL catalog.
+java -jar target/dht-collector-java-0.1.0.jar --mode catalog --command stats
+java -jar target/dht-collector-java-0.1.0.jar --mode catalog --command search \
+  --query "linux image" --limit 20
 
-# Write collector and metadata events directly to a local SQLite database.
-node src/index.js health --duration-ms 5000 --db ./var/dht-search.db
-node src/metadata-fetcher.js --input ./var/events.jsonl --db ./var/dht-search.db
-
-# Ingest normalized manifests into the local development catalog and search it.
-node src/catalog.js ingest --input ./var/metadata-events.jsonl --db ./var/catalog.db
-node src/catalog.js search --query "linux image" --db ./var/catalog.db
-
-# Start the local dashboard (http://127.0.0.1:4173).
-npm run dashboard -- --db ./var/dht-search.db --port 4173
+# Start the dashboard (http://127.0.0.1:4173).
+java -jar target/dht-collector-java-0.1.0.jar --mode dashboard \
+  --http-host 127.0.0.1 --http-port 4173 --static-path ../web/public
 ```
 
 ## Passive DHT Discovery
@@ -89,7 +86,7 @@ only from up to three discovered Peers by default, verifies the v1 infohash,
 and writes all discovery, metadata, and catalog events to the same database:
 
 ```bash
-npm run approved-index -- \
+java -jar java/target/dht-collector-java-0.1.0.jar --mode approved-indexer \
   --input ./var/approved-infohashes.jsonl \
   --db ./var/dht-search.db \
   --port 51413
@@ -104,7 +101,7 @@ publisher `.torrent` file can be imported as a separately labeled, verified
 metadata source; it never downloads payload data:
 
 ```bash
-npm run import-torrent -- \
+java -jar java/target/dht-collector-java-0.1.0.jar --mode import-torrent \
   --input ./release.torrent \
   --authorization-ref publisher-release-record \
   --db ./var/dht-search.db
@@ -114,27 +111,34 @@ The CLI binds an ephemeral UDP port by default. Use `--port` only when a
 stable port is required. Use `--no-peer-address` when output must omit peer
 endpoint details.
 
-## Java collector
+## Java runtime
 
-The passive collector also has a Java 21 implementation under `java/`. It uses
-mldht for the DHT protocol and routing table, virtual threads for observation
-work, and HikariCP for PostgreSQL pooling:
+The production collector, BEP 9 metadata worker, and dashboard API have a Java
+21 implementation under `java/`. It uses mldht for DHT routing and metadata
+transport, virtual threads for bounded concurrent work, and HikariCP for
+PostgreSQL pooling:
 
 ```bash
 cd java
 mvn test
 mvn package
-java -jar target/dht-collector-java-0.1.0.jar --port 51413 --dht-nodes 12
+java -jar target/dht-collector-java-0.1.0.jar \
+  --mode collector --port 51413 --dht-nodes 12
+
+java -jar target/dht-collector-java-0.1.0.jar \
+  --mode dashboard --http-host 127.0.0.1 --http-port 4173 \
+  --static-path ../web/public
 ```
 
-The Java service uses the same `discovered_resource` and `probe_event` tables,
-so it can be introduced without a database migration. It covers passive DHT
-routing and resource observation. BEP9 metadata fetching and the authorized
-indexer remain in the existing Node.js tools until their Java worker is
-migrated separately. A generic unit template is in
-`deploy/dht-passive-collector-java.service`; adjust paths and the private
-environment-file location for the target host. Keep the current Node service
-running when metadata jobs must continue to execute.
+The Java service uses the existing PostgreSQL catalog, including
+`discovered_resource`, `probe_event`, `metadata_job`, `content`, and
+`file_entry`. It keeps only resources seen in the last 24 hours resident,
+claims metadata retries from the database, verifies the BEP 9 info dictionary,
+and writes searchable content. Generic unit templates are in
+`deploy/dht-passive-collector-java.service` and
+`deploy/dht-search-dashboard-java.service`; adjust paths and the private
+environment-file location for the target host. The environment file must stay
+outside the repository.
 
 ## Event contract
 
@@ -169,10 +173,10 @@ actual operation failures, and protocol warning occurrences. A warning such as
 decoder; it is aggregated separately and does not mean the collector failed to
 join the network.
 
-`catalog.js` uses Node 22's built-in SQLite and FTS5 as the local development
-and rollback adapter. Production uses PostgreSQL with batched event writes,
-pre-aggregated minute metrics, persistent counters, and concurrent job claims
-using `FOR UPDATE SKIP LOCKED`.
+The Java `migrate-sqlite` mode uses SQLite JDBC as a one-time import/rollback
+adapter. Production uses PostgreSQL with pooled connections, pre-aggregated
+minute metrics, persistent counters, and concurrent job claims using
+`FOR UPDATE SKIP LOCKED`.
 
 Both production services should load a private environment file (for example,
 `/etc/dht-search/db.env`, kept outside this repository). PostgreSQL is selected
@@ -188,17 +192,20 @@ delta. The delta is idempotent and reconciles content keys before verification:
 set -a
 source /etc/dht-search/db.env
 set +a
-npm run migrate:postgres -- --db ./var/dht-search.db --mode full
+java -jar java/target/dht-collector-java-0.1.0.jar --mode migrate-sqlite \
+  --input ./var/dht-search.db --migration-mode full
 systemctl stop dht-passive-collector.service dht-search-dashboard.service
-npm run migrate:postgres -- --db ./var/dht-search.db --mode delta
-npm run migrate:postgres -- --db ./var/dht-search.db --mode verify
+java -jar java/target/dht-collector-java-0.1.0.jar --mode migrate-sqlite \
+  --input ./var/dht-search.db --migration-mode delta
+java -jar java/target/dht-collector-java-0.1.0.jar --mode migrate-sqlite \
+  --input ./var/dht-search.db --migration-mode verify
 ```
 
 Keep the SQLite file after cutover. To roll back, remove the `EnvironmentFile`
 line from both systemd units, run `systemctl daemon-reload`, and restart them;
 the existing `--db` arguments then select SQLite.
 
-`web/server.js` exposes dashboard endpoints
+`DashboardServer.java` exposes dashboard endpoints
 (`GET /api/dashboard`, paginated `GET /api/content` and `GET /api/search`,
 `GET /api/health`, and the fixed service control endpoint `/api/sniffer`) and
 serves the single-page console from `web/public`. Pagination uses `page` and

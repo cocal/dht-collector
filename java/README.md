@@ -1,9 +1,10 @@
-# Java DHT Collector
+# Java DHT Runtime
 
-This module is the Java 21 implementation of the passive Mainline DHT
-collector. mldht provides the Mainline DHT routing table, bootstrap, token, and
-KRPC handling. Java 21 virtual threads process observations without blocking
-the UDP network loop, and HikariCP provides PostgreSQL connection pooling.
+This module is the Java 21 runtime for the Mainline DHT collector, BEP 9
+metadata worker, and dashboard API. mldht provides the routing table, KRPC, and
+metadata transport. Java 21 virtual threads process observations and metadata
+jobs without blocking the UDP network loop, and HikariCP provides PostgreSQL
+connection pooling.
 
 Build and test:
 
@@ -16,13 +17,36 @@ Run with the same PostgreSQL environment used by the deployment:
 
 ```bash
 java -jar target/dht-collector-java-0.1.0.jar \
-  --port 51413 --dht-nodes 12 --max-concurrent 160
+  --mode collector --port 51413 --dht-nodes 12 --max-concurrent 160 \
+  --metadata-concurrent 8 --metadata-timeout-seconds 12
+```
+
+Run the dashboard and static web UI from the same jar:
+
+```bash
+java -jar target/dht-collector-java-0.1.0.jar \
+  --mode dashboard --http-host 127.0.0.1 --http-port 4173 \
+  --static-path ../web/public
+```
+
+The same jar also replaces the former Node CLI tools:
+
+```bash
+java -jar target/dht-collector-java-0.1.0.jar --mode catalog --command stats
+java -jar target/dht-collector-java-0.1.0.jar --mode catalog --command search --query linux
+java -jar target/dht-collector-java-0.1.0.jar --mode metadata-worker --input events.jsonl
+java -jar target/dht-collector-java-0.1.0.jar --mode approved-indexer --input approved.jsonl
+java -jar target/dht-collector-java-0.1.0.jar --mode import-torrent \
+  --input release.torrent --authorization-ref publisher-record
+java -jar target/dht-collector-java-0.1.0.jar --mode migrate-sqlite \
+  --input ./var/dht-search.db --migration-mode verify
 ```
 
 `DATABASE_URL`, `PGUSER`, and `PGPASSWORD` are read from the process
 environment. Keep that environment file outside the repository. The collector
 loads only active resources observed in the last 24 hours into memory and uses
 the database as the source of truth for older cache misses. Repeated sightings
-are flushed to PostgreSQL in bounded batches every 30 seconds. This module is
-the passive DHT observation layer; BEP9 metadata fetching is still performed
-by the Node.js metadata worker.
+are flushed to PostgreSQL in bounded batches every 30 seconds. The metadata
+worker claims persisted jobs, verifies the returned info dictionary against
+the requested infohash, and upserts content and file rows. The dashboard reads
+the same PostgreSQL catalog through its own bounded connection pool.

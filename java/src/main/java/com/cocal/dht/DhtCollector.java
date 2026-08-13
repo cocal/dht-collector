@@ -35,6 +35,8 @@ final class DhtCollector implements AutoCloseable {
   private final ExecutorService tasks = Executors.newVirtualThreadPerTaskExecutor();
   private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
   private final Semaphore permits;
+  private final Semaphore metadataPermits;
+  private final MetadataFetcher metadata;
   private final Map<String, Instant> pendingTouches = new ConcurrentHashMap<>();
   private final Map<String, LongAdder> queryCounts = new ConcurrentHashMap<>();
   private final AtomicLong discovered;
@@ -43,11 +45,12 @@ final class DhtCollector implements AutoCloseable {
   DhtCollector(Config config, Catalog catalog) throws Exception {
     this.config = config;
     this.catalog = catalog;
-    var recent = catalog.recentResources(Instant.now().minus(Duration.ofHours(24)));
-    this.cache = new RecentResourceCache(CACHE_TTL_MS, recent);
+    this.cache = new RecentResourceCache(CACHE_TTL_MS);
+    catalog.loadRecentResources(Instant.now().minus(Duration.ofHours(24)), cache::load);
     this.discovered = new AtomicLong(
         config.maxResources() > 0 ? catalog.countDiscoveredResources() : 0);
     this.permits = new Semaphore(config.maxConcurrent());
+    this.metadataPermits = new Semaphore(config.metadataConcurrent());
     Files.createDirectories(config.storagePath());
     try {
       for (int index = 0; index < config.dhtNodes(); index++) {
@@ -57,6 +60,7 @@ final class DhtCollector implements AutoCloseable {
         dht.start(configuration(port, config.storagePath().resolve("node-" + port)));
         nodes.add(dht);
       }
+      metadata = new MetadataFetcher(nodes, config.metadataConcurrent(), config.metadataTimeoutSeconds());
     } catch (Exception error) {
       nodes.forEach(DHT::stop);
       scheduler.shutdownNow();
@@ -75,6 +79,14 @@ final class DhtCollector implements AutoCloseable {
         System.err.println("scheduled catalog flush failed: " + error.getMessage());
       }
     }, 30, 30, TimeUnit.SECONDS);
+    scheduler.scheduleWithFixedDelay(() -> {
+      try { pollMetadataJobs(); }
+      catch (Exception error) { System.err.println("metadata job poll failed: " + error.getMessage()); }
+    }, 5, 5, TimeUnit.SECONDS);
+    scheduler.scheduleWithFixedDelay(() -> {
+      try { catalog.markInvalidResources(Instant.now().minus(Duration.ofDays(7))); }
+      catch (Exception error) { System.err.println("resource expiry sweep failed: " + error.getMessage()); }
+    }, 1, 1, TimeUnit.HOURS);
     Runtime.getRuntime().addShutdownHook(new Thread(this::close));
   }
 
@@ -127,6 +139,7 @@ final class DhtCollector implements AutoCloseable {
     if (cache.contains(infoHash, nowMillis)) {
       cache.observe(infoHash, nowMillis);
       pendingTouches.put(infoHash, now);
+      if (query.equals("announce_peer")) catalog.queueMetadataJob(infoHash, now, 100, true);
       return;
     }
     if (config.maxResources() > 0 && discovered.get() >= config.maxResources() && !catalog.exists(infoHash)) return;
@@ -144,6 +157,7 @@ final class DhtCollector implements AutoCloseable {
           "{\"event\":\"dht.resource_discovered\",\"info_hash\":\"" + infoHash
               + "\",\"query\":\"" + query + "\"}");
     }
+    catalog.queueMetadataJob(infoHash, now, query.equals("announce_peer") ? 100 : 10, query.equals("announce_peer"));
   }
 
   private void flushTouches() throws Exception {
@@ -151,6 +165,54 @@ final class DhtCollector implements AutoCloseable {
     Map<String, Instant> copy = new HashMap<>(pendingTouches);
     catalog.touch(copy);
     copy.forEach((hash, observedAt) -> pendingTouches.remove(hash, observedAt));
+  }
+
+  private void pollMetadataJobs() throws Exception {
+    int capacity = metadataPermits.availablePermits();
+    if (capacity == 0) return;
+    for (String infoHash : catalog.claimMetadataJobs(capacity, Instant.now())) {
+      if (!metadataPermits.tryAcquire()) return;
+      tasks.submit(() -> {
+        try {
+          metadata.fetch(infoHash).toCompletableFuture()
+              .get(config.metadataTimeoutSeconds() + 5L, TimeUnit.SECONDS)
+              .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
+                  () -> completeMetadataFailure(infoHash, "no metadata result"));
+        } catch (Exception error) {
+          completeMetadataFailure(infoHash, error.getMessage());
+        } finally {
+          metadataPermits.release();
+        }
+      });
+    }
+  }
+
+  private void completeMetadataSuccess(String infoHash, Manifest manifest) {
+    try {
+      catalog.upsertManifest(manifest);
+      catalog.event("metadata.fetch_completed", infoHash,
+          "{\"event\":\"metadata.fetch_completed\",\"info_hash\":\"" + infoHash
+              + "\",\"name\":\"" + jsonEscape(manifest.name()) + "\"}", "passive");
+      catalog.completeMetadataJob(infoHash, true, Instant.now());
+    } catch (Exception error) {
+      System.err.println("metadata persistence failed: " + error.getMessage());
+    }
+  }
+
+  private void completeMetadataFailure(String infoHash, String message) {
+    try {
+      catalog.event("metadata.fetch_failed", infoHash,
+          "{\"event\":\"metadata.fetch_failed\",\"info_hash\":\"" + infoHash
+              + "\",\"message\":\"" + jsonEscape(message == null ? "unknown" : message) + "\"}", "passive");
+      catalog.completeMetadataJob(infoHash, false, Instant.now());
+    } catch (Exception error) {
+      System.err.println("metadata failure persistence failed: " + error.getMessage());
+    }
+  }
+
+  private static String jsonEscape(String value) {
+    return value.replace("\\", "\\\\").replace("\"", "\\\"")
+        .replace("\n", "\\n").replace("\r", "\\r");
   }
 
   private void flushQueries() throws Exception {
@@ -168,6 +230,7 @@ final class DhtCollector implements AutoCloseable {
     if (stopping) return;
     stopping = true;
     nodes.forEach(DHT::stop);
+    metadata.close();
     scheduler.shutdownNow();
     tasks.close();
     try {

@@ -1,5 +1,5 @@
 [Unit]
-Description=Passive Mainline DHT resource collector (Java)
+Description=Mainline DHT collector and metadata worker (Java)
 After=network-online.target dht-search-dashboard.service
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/vibe/dht-collector/java
 EnvironmentFile=/etc/dht-search/db.env
-ExecStart=/usr/bin/java -XX:+UseG1GC -XX:MaxRAMPercentage=70 -jar /root/vibe/dht-collector/java/target/dht-collector-java-0.1.0.jar --address 0.0.0.0 --port 51413 --dht-nodes 12 --max-concurrent 160 --pool-size 5
+ExecStart=/usr/bin/java -Xms128m -Xmx1200m -XX:+UseG1GC -jar /root/vibe/dht-collector/java/target/dht-collector-java-0.1.0.jar --mode collector --address 0.0.0.0 --port 51413 --dht-nodes 12 --max-concurrent 160 --metadata-concurrent 8 --metadata-timeout-seconds 12 --pool-size 5 --storage-path /root/vibe/dht-collector/var/java-dht
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=45
