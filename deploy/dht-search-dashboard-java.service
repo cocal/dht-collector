@@ -9,6 +9,7 @@ EnvironmentFile=/etc/dht-search/db.env
 ExecStart=/usr/bin/java -Xms32m -Xmx256m -XX:+UseG1GC -jar /root/vibe/dht-collector/java/target/dht-collector-java-0.1.0.jar --mode dashboard --http-host 127.0.0.1 --http-port 4173 --pool-size 2 --static-path /root/vibe/dht-collector/web/public
 Restart=on-failure
 RestartSec=5
+SuccessExitStatus=143
 TimeoutStopSec=10
 NoNewPrivileges=true
 PrivateTmp=true
