@@ -37,6 +37,7 @@ final class DhtCollector implements AutoCloseable {
 
   private final Config config;
   private final Catalog catalog;
+  private final MonitorLogger monitor;
   private final RecentResourceCache cache;
   private final ArrayList<DHT> nodes = new ArrayList<>();
   private final ExecutorService tasks = Executors.newVirtualThreadPerTaskExecutor();
@@ -55,9 +56,15 @@ final class DhtCollector implements AutoCloseable {
     this.config = config;
     this.catalog = catalog;
     this.cache = new RecentResourceCache(CACHE_TTL_MS);
-    catalog.loadRecentResources(Instant.now().minus(Duration.ofHours(24)), cache::load);
-    this.discovered = new AtomicLong(
-        config.maxResources() > 0 ? catalog.countDiscoveredResources() : 0);
+    this.monitor = new MonitorLogger();
+    try {
+      catalog.loadRecentResources(Instant.now().minus(Duration.ofHours(24)), cache::load);
+      this.discovered = new AtomicLong(
+          config.maxResources() > 0 ? catalog.countDiscoveredResources() : 0);
+    } catch (Exception error) {
+      monitor.close();
+      throw error;
+    }
     this.permits = new Semaphore(config.maxConcurrent());
     this.metadataPermits = new Semaphore(config.metadataConcurrent());
     Files.createDirectories(config.storagePath());
@@ -74,6 +81,7 @@ final class DhtCollector implements AutoCloseable {
       nodes.forEach(DHT::stop);
       scheduler.shutdownNow();
       tasks.close();
+      monitor.close();
       throw error;
     }
   }
@@ -85,16 +93,23 @@ final class DhtCollector implements AutoCloseable {
         cache.prune(System.currentTimeMillis());
         flushQueries();
       } catch (Exception error) {
+        monitor.metric("collector.failed", 1);
         System.err.println("scheduled catalog flush failed: " + error.getMessage());
       }
     }, 30, 30, TimeUnit.SECONDS);
     scheduler.scheduleWithFixedDelay(() -> {
       try { pollMetadataJobs(); }
-      catch (Exception error) { System.err.println("metadata job poll failed: " + error.getMessage()); }
+      catch (Exception error) {
+        monitor.metric("collector.failed", 1);
+        System.err.println("metadata job poll failed: " + error.getMessage());
+      }
     }, 5, 5, TimeUnit.SECONDS);
     scheduler.scheduleWithFixedDelay(() -> {
       try { catalog.markInvalidResources(Instant.now().minus(Duration.ofDays(7))); }
-      catch (Exception error) { System.err.println("resource expiry sweep failed: " + error.getMessage()); }
+      catch (Exception error) {
+        monitor.metric("collector.failed", 1);
+        System.err.println("resource expiry sweep failed: " + error.getMessage());
+      }
     }, 1, 1, TimeUnit.HOURS);
     Runtime.getRuntime().addShutdownHook(new Thread(this::close));
   }
@@ -159,6 +174,7 @@ final class DhtCollector implements AutoCloseable {
           startMetadataForAnnounce(infoHash);
         }
       } catch (Exception error) {
+        monitor.metric("collector.failed", 1);
         System.err.println("resource observation failed: " + error.getMessage());
       } finally {
         permits.release();
@@ -186,6 +202,7 @@ final class DhtCollector implements AutoCloseable {
     }
     if (fresh) {
       discovered.incrementAndGet();
+      monitor.metric("dht.resource_discovered", 1);
       catalog.event("dht.resource_discovered", infoHash,
           "{\"event\":\"dht.resource_discovered\",\"info_hash\":\"" + infoHash
               + "\",\"query\":\"" + query + "\"}");
@@ -204,7 +221,7 @@ final class DhtCollector implements AutoCloseable {
     int capacity = metadataPermits.availablePermits();
     if (capacity == 0) return;
     for (String infoHash : catalog.claimMetadataJobs(capacity, Instant.now())) {
-      if (!runningMetadata.putIfAbsent(infoHash, Boolean.TRUE)) continue;
+      if (runningMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) continue;
       if (!metadataPermits.tryAcquire()) return;
       tasks.submit(() -> {
         try {
@@ -224,7 +241,7 @@ final class DhtCollector implements AutoCloseable {
   }
 
   private void startMetadataForAnnounce(String infoHash) {
-    if (!runningMetadata.putIfAbsent(infoHash, Boolean.TRUE)) return;
+    if (runningMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) return;
     if (!metadataPermits.tryAcquire()) {
       runningMetadata.remove(infoHash);
       return;
@@ -254,22 +271,26 @@ final class DhtCollector implements AutoCloseable {
   private void completeMetadataSuccess(String infoHash, Manifest manifest) {
     try {
       catalog.upsertManifest(manifest);
+      monitor.metric("metadata.fetch_completed", 1);
       catalog.event("metadata.fetch_completed", infoHash,
           "{\"event\":\"metadata.fetch_completed\",\"info_hash\":\"" + infoHash
               + "\",\"name\":\"" + jsonEscape(manifest.name()) + "\"}", "passive");
       catalog.completeMetadataJob(infoHash, true, Instant.now());
     } catch (Exception error) {
+      monitor.metric("collector.failed", 1);
       System.err.println("metadata persistence failed: " + error.getMessage());
     }
   }
 
   private void completeMetadataFailure(String infoHash, String message) {
     try {
+      monitor.metric("metadata.fetch_failed", 1);
       catalog.event("metadata.fetch_failed", infoHash,
           "{\"event\":\"metadata.fetch_failed\",\"info_hash\":\"" + infoHash
               + "\",\"message\":\"" + jsonEscape(message == null ? "unknown" : message) + "\"}", "passive");
       catalog.completeMetadataJob(infoHash, false, Instant.now());
     } catch (Exception error) {
+      monitor.metric("collector.failed", 1);
       System.err.println("metadata failure persistence failed: " + error.getMessage());
     }
   }
@@ -295,6 +316,7 @@ final class DhtCollector implements AutoCloseable {
     for (var entry : queryCounts.entrySet()) {
       long count = entry.getValue().sumThenReset();
       if (count > 0) {
+        monitor.metric("dht.query_summary", count, entry.getKey());
         catalog.event("dht.query_summary", null,
             "{\"event\":\"dht.query_summary\",\"query\":\"" + entry.getKey()
                 + "\",\"occurrences\":" + count + ",\"interval_seconds\":30}");
@@ -315,5 +337,6 @@ final class DhtCollector implements AutoCloseable {
     } catch (Exception error) {
       System.err.println("final catalog flush failed: " + error.getMessage());
     }
+    monitor.close();
   }
 }

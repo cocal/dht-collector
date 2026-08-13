@@ -177,6 +177,39 @@ actual operation failures, and protocol warning occurrences. A warning such as
 decoder; it is aggregated separately and does not mean the collector failed to
 join the network.
 
+### Decoupled monitoring path
+
+The collector no longer updates `minute_metric` while inserting a fact into
+`probe_event`. It emits bounded, asynchronous `monitor.v1` JSON records to
+stdout instead. Each record has a UTC ISO-8601 `occurred_at` ending in `Z`, for
+example:
+
+```json
+{"schema":"monitor.v1","event_id":"...","service":"dht-collector","metric":"dht.query_summary","occurred_at":"2026-08-13T15:44:17.213288Z","value":12,"query":"get_peers"}
+```
+
+The local `monitor-center-agent` should follow both `tinysocket` and
+`dht-passive-collector.service` journals and forward these records through its
+existing spool/JetStream path. The monitor center stores raw records and
+minute aggregates independently. The DHT dashboard uses the companion
+`dht-monitor-ingest.service`, which reads the same journal and batches only
+validated monitor records into `minute_metric`; it does not copy every monitor
+line into the fact tables. The monitor center retains raw monitor records and
+handles cross-source event deduplication. Fact persistence remains in the
+collector transaction. Install the unit from
+`deploy/dht-monitor-ingest.service` and enable it alongside the collector.
+
+For a one-shot or manual stream, the same parser is available as:
+
+```bash
+java -jar java/target/dht-collector-java-0.1.0.jar \
+  --mode monitor-ingest --input - --batch-size 128 --flush-ms 1000
+```
+
+Only `monitor.v1` records are accepted. Local timestamps without an explicit
+UTC offset are rejected, preventing host timezone settings from shifting trend
+buckets.
+
 The Java `migrate-sqlite` mode uses SQLite JDBC as a one-time import/rollback
 adapter. Production uses PostgreSQL with pooled connections, pre-aggregated
 minute metrics, persistent counters, and concurrent job claims using

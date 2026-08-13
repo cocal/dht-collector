@@ -24,7 +24,7 @@ final class Cli {
 
   static boolean supports(String mode) {
     return Set.of("health", "lookup", "metadata-worker", "catalog", "approved-indexer",
-        "import-torrent", "migrate-sqlite").contains(mode);
+        "import-torrent", "migrate-sqlite", "monitor-ingest").contains(mode);
   }
 
   static void run(String[] rawArgs) throws Exception {
@@ -37,6 +37,7 @@ final class Cli {
       case "approved-indexer" -> approvedIndexer(args);
       case "import-torrent" -> importTorrent(args);
       case "migrate-sqlite" -> SqliteMigrator.run(args, database(args, true));
+      case "monitor-ingest" -> monitorIngest(args);
       default -> throw new IllegalArgumentException("unsupported mode");
     }
   }
@@ -143,6 +144,60 @@ final class Cli {
         System.out.println(JSON.writeValueAsString(map("accepted", accepted)));
       } else throw new IllegalArgumentException("--command must be stats, search, or ingest");
     }
+  }
+
+  /** Parse monitor.v1 records from a journal stream and batch them into minute_metric. */
+  private static void monitorIngest(Args args) throws Exception {
+    try (Catalog catalog = database(args, true)) {
+      catalog.initialize();
+      Process journal = null;
+      BufferedReader lines;
+      Path input = args.path("input", null);
+      if (input != null && !input.toString().equals("-")) {
+        lines = Files.newBufferedReader(input, StandardCharsets.UTF_8);
+      } else if (args.value("journal-unit", null) != null) {
+        String unit = args.required("journal-unit");
+        journal = new ProcessBuilder("journalctl", "--unit", unit, "--follow", "--output", "json",
+            "--no-pager", "--since", "now").redirectError(ProcessBuilder.Redirect.INHERIT).start();
+        lines = new BufferedReader(new InputStreamReader(journal.getInputStream(), StandardCharsets.UTF_8));
+      } else {
+        lines = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+      }
+      int batchSize = args.positiveInt("batch-size", 128);
+      long flushMillis = args.positiveLong("flush-ms", 1_000);
+      List<MonitorPoint> batch = new ArrayList<>(batchSize);
+      long accepted = 0, skipped = 0, lastFlush = System.nanoTime();
+      try (lines) {
+        for (String line; (line = lines.readLine()) != null;) {
+          if (line.isBlank()) continue;
+          Map<String, Object> raw;
+          try { raw = JSON.readValue(line, new TypeReference<>() {}); }
+          catch (Exception ignored) { skipped++; continue; }
+          Map<String, Object> event = monitorPayload(raw);
+          var point = MonitorPoint.parse(event);
+          if (point.isEmpty()) { skipped++; continue; }
+          batch.add(point.get()); accepted++;
+          long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastFlush);
+          if (batch.size() >= batchSize || elapsed >= flushMillis) {
+            catalog.aggregateMonitorBatch(batch);
+            batch.clear();
+            lastFlush = System.nanoTime();
+          }
+        }
+      } finally {
+        if (!batch.isEmpty()) catalog.aggregateMonitorBatch(batch);
+        if (journal != null) journal.destroy();
+      }
+      System.out.println(JSON.writeValueAsString(map("accepted", accepted, "skipped", skipped)));
+    }
+  }
+
+  private static Map<String, Object> monitorPayload(Map<String, Object> raw) {
+    if ("monitor.v1".equals(String.valueOf(raw.get("schema")))) return raw;
+    Object message = raw.get("MESSAGE");
+    if (!(message instanceof String value) || value.isBlank()) return Map.of();
+    try { return JSON.readValue(value, new TypeReference<>() {}); }
+    catch (Exception ignored) { return Map.of(); }
   }
 
   private static void importTorrent(Args args) throws Exception {
@@ -273,7 +328,7 @@ final class Cli {
   }
 
   static final class Args {
-    private static final Set<String> FLAGS = Set.of("no-peer-address", "quiet");
+    private static final Set<String> FLAGS = Set.of("no-peer-address", "quiet", "once");
     private final Map<String,String> values = new LinkedHashMap<>();
     private final Set<String> flags = new LinkedHashSet<>();
     static Args parse(String[] args) {

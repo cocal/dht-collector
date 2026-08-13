@@ -40,6 +40,8 @@ java -jar target/dht-collector-java-0.1.0.jar --mode import-torrent \
   --input release.torrent --authorization-ref publisher-record
 java -jar target/dht-collector-java-0.1.0.jar --mode migrate-sqlite \
   --input ./var/dht-search.db --migration-mode verify
+java -jar target/dht-collector-java-0.1.0.jar --mode monitor-ingest \
+  --journal-unit dht-passive-collector.service --batch-size 128 --flush-ms 1000
 ```
 
 `DATABASE_URL`, `PGUSER`, and `PGPASSWORD` are read from the process
@@ -50,3 +52,9 @@ are flushed to PostgreSQL in bounded batches every 30 seconds. The metadata
 worker claims persisted jobs, verifies the returned info dictionary against
 the requested infohash, and upserts content and file rows. The dashboard reads
 the same PostgreSQL catalog through its own bounded connection pool.
+
+Trend metrics are decoupled from fact writes. The collector emits asynchronous
+`monitor.v1` JSON lines with UTC `occurred_at` timestamps; the journal agent and
+the independent `monitor-ingest` mode parse and aggregate them into minute
+buckets without copying each monitor line into the fact tables. The collector
+does not write `minute_metric` in its event transaction.

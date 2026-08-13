@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.BiConsumer;
 
@@ -60,22 +61,27 @@ final class Catalog implements AutoCloseable {
 
   void initialize() throws SQLException {
     try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
-      statement.executeUpdate("CREATE TABLE IF NOT EXISTS content (content_id text PRIMARY KEY, info_hash text NOT NULL UNIQUE, variant text NOT NULL, name text NOT NULL, total_size bigint NOT NULL, file_count integer NOT NULL, metadata_size integer NOT NULL, metadata_sha256 text NOT NULL, policy_state text NOT NULL DEFAULT 'approved', files_text text NOT NULL DEFAULT '', created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)");
-      statement.executeUpdate("ALTER TABLE content ADD COLUMN IF NOT EXISTS files_text text NOT NULL DEFAULT ''");
-      statement.executeUpdate("CREATE INDEX IF NOT EXISTS content_updated_idx ON content (updated_at DESC)");
-      statement.executeUpdate("CREATE TABLE IF NOT EXISTS file_entry (content_id text NOT NULL REFERENCES content(content_id) ON DELETE CASCADE, ordinal integer NOT NULL, path text NOT NULL, size bigint NOT NULL, PRIMARY KEY (content_id, ordinal))");
-      statement.executeUpdate("CREATE TABLE IF NOT EXISTS discovered_resource (info_hash text PRIMARY KEY, first_seen_at timestamptz NOT NULL, last_seen_at timestamptz NOT NULL, source text NOT NULL, state text NOT NULL DEFAULT 'active')");
-      statement.executeUpdate("ALTER TABLE discovered_resource ADD COLUMN IF NOT EXISTS last_seen_at timestamptz");
-      statement.executeUpdate("ALTER TABLE discovered_resource ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'active'");
-      statement.executeUpdate("UPDATE discovered_resource SET last_seen_at=COALESCE(last_seen_at, first_seen_at),state=COALESCE(state,'active') WHERE last_seen_at IS NULL OR state IS NULL");
-      statement.executeUpdate("CREATE INDEX IF NOT EXISTS discovered_resource_state_seen_idx ON discovered_resource (state, last_seen_at)");
-      statement.executeUpdate("CREATE TABLE IF NOT EXISTS probe_event (event_id text PRIMARY KEY, event_type text NOT NULL, occurred_at timestamptz NOT NULL, info_hash text, peer_host text, peer_port integer, source_host text, source_port integer, mode text, message text, raw_event jsonb NOT NULL)");
-      statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_occurred_at_idx ON probe_event (occurred_at DESC)");
-      statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_info_hash_idx ON probe_event (info_hash, occurred_at DESC)");
-      statement.executeUpdate("CREATE TABLE IF NOT EXISTS metadata_job (info_hash text PRIMARY KEY, priority integer NOT NULL DEFAULT 0, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)");
-      statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_due_idx ON metadata_job (priority DESC, next_attempt_at ASC, updated_at DESC)");
-      statement.executeUpdate("CREATE TABLE IF NOT EXISTS catalog_counter (name text PRIMARY KEY, value bigint NOT NULL DEFAULT 0)");
-      statement.executeUpdate("CREATE TABLE IF NOT EXISTS minute_metric (bucket timestamptz PRIMARY KEY, links bigint NOT NULL DEFAULT 0, queries bigint NOT NULL DEFAULT 0, failures bigint NOT NULL DEFAULT 0, warnings bigint NOT NULL DEFAULT 0)");
+      try (ResultSet ignored = statement.executeQuery("SELECT pg_advisory_lock(hashtextextended('dht-collector-schema', 0))")) { }
+      try {
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS content (content_id text PRIMARY KEY, info_hash text NOT NULL UNIQUE, variant text NOT NULL, name text NOT NULL, total_size bigint NOT NULL, file_count integer NOT NULL, metadata_size integer NOT NULL, metadata_sha256 text NOT NULL, policy_state text NOT NULL DEFAULT 'approved', files_text text NOT NULL DEFAULT '', created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)");
+        statement.executeUpdate("ALTER TABLE content ADD COLUMN IF NOT EXISTS files_text text NOT NULL DEFAULT ''");
+        statement.executeUpdate("CREATE INDEX IF NOT EXISTS content_updated_idx ON content (updated_at DESC)");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS file_entry (content_id text NOT NULL REFERENCES content(content_id) ON DELETE CASCADE, ordinal integer NOT NULL, path text NOT NULL, size bigint NOT NULL, PRIMARY KEY (content_id, ordinal))");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS discovered_resource (info_hash text PRIMARY KEY, first_seen_at timestamptz NOT NULL, last_seen_at timestamptz NOT NULL, source text NOT NULL, state text NOT NULL DEFAULT 'active')");
+        statement.executeUpdate("ALTER TABLE discovered_resource ADD COLUMN IF NOT EXISTS last_seen_at timestamptz");
+        statement.executeUpdate("ALTER TABLE discovered_resource ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'active'");
+        statement.executeUpdate("UPDATE discovered_resource SET last_seen_at=COALESCE(last_seen_at, first_seen_at),state=COALESCE(state,'active') WHERE last_seen_at IS NULL OR state IS NULL");
+        statement.executeUpdate("CREATE INDEX IF NOT EXISTS discovered_resource_state_seen_idx ON discovered_resource (state, last_seen_at)");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS probe_event (event_id text PRIMARY KEY, event_type text NOT NULL, occurred_at timestamptz NOT NULL, info_hash text, peer_host text, peer_port integer, source_host text, source_port integer, mode text, message text, raw_event jsonb NOT NULL)");
+        statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_occurred_at_idx ON probe_event (occurred_at DESC)");
+        statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_info_hash_idx ON probe_event (info_hash, occurred_at DESC)");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS metadata_job (info_hash text PRIMARY KEY, priority integer NOT NULL DEFAULT 0, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)");
+        statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_due_idx ON metadata_job (priority DESC, next_attempt_at ASC, updated_at DESC)");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS catalog_counter (name text PRIMARY KEY, value bigint NOT NULL DEFAULT 0)");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS minute_metric (bucket timestamptz PRIMARY KEY, links bigint NOT NULL DEFAULT 0, queries bigint NOT NULL DEFAULT 0, failures bigint NOT NULL DEFAULT 0, warnings bigint NOT NULL DEFAULT 0)");
+      } finally {
+        try (ResultSet ignored = statement.executeQuery("SELECT pg_advisory_unlock(hashtextextended('dht-collector-schema', 0))")) { }
+      }
     }
   }
 
@@ -149,15 +155,6 @@ final class Catalog implements AutoCloseable {
           incrementCounter(connection, "probes", 1);
           if (type.equals("dht.peer_discovered")) incrementCounter(connection, "peers", 1);
           if (type.equals("dht.lookup_completed")) incrementCounter(connection, "lookups", 1);
-          long links = type.equals("dht.resource_discovered") ? 1 : 0;
-          long queries = type.equals("dht.query_summary") ? jsonLong(rawJson, "occurrences") : 0;
-          long failures = type.endsWith("failed") || type.equals("dht.error") ? 1 : 0;
-          long warnings = type.equals("dht.warning") ? 1 : 0;
-          if (links + queries + failures + warnings > 0) {
-            try (PreparedStatement metric = connection.prepareStatement("INSERT INTO minute_metric(bucket,links,queries,failures,warnings) VALUES(date_trunc('minute',?::timestamptz),?,?,?,?) ON CONFLICT(bucket) DO UPDATE SET links=minute_metric.links+excluded.links,queries=minute_metric.queries+excluded.queries,failures=minute_metric.failures+excluded.failures,warnings=minute_metric.warnings+excluded.warnings")) {
-              metric.setTimestamp(1, Timestamp.from(now)); metric.setLong(2, links); metric.setLong(3, queries); metric.setLong(4, failures); metric.setLong(5, warnings); metric.executeUpdate();
-            }
-          }
         }
       }
       connection.commit();
@@ -183,7 +180,7 @@ final class Catalog implements AutoCloseable {
           statement.setString(10, nullable(event.get("message"))); statement.setString(11, rawJson);
           inserted = statement.executeUpdate();
         }
-        if (inserted > 0) updateEventAggregates(connection, type, Instant.parse(occurred), rawJson);
+        if (inserted > 0) updateEventCounters(connection, type);
         connection.commit();
       } catch (Exception error) {
         connection.rollback();
@@ -202,26 +199,42 @@ final class Catalog implements AutoCloseable {
   private static String string(Object value) { return value == null ? "" : String.valueOf(value); }
   private static String nullable(Object value) { String result = string(value); return result.isBlank() ? null : result; }
 
-  private static void updateEventAggregates(Connection connection, String type, Instant occurredAt, String rawJson) throws SQLException {
+  private static void updateEventCounters(Connection connection, String type) throws SQLException {
     incrementCounter(connection, "probes", 1);
     if (type.equals("dht.peer_discovered")) incrementCounter(connection, "peers", 1);
     if (type.equals("dht.lookup_completed")) incrementCounter(connection, "lookups", 1);
-    long links = type.equals("dht.resource_discovered") ? 1 : 0;
-    long queries = type.equals("dht.query_summary") ? jsonLong(rawJson, "occurrences") : type.equals("dht.query_received") ? 1 : 0;
-    long failures = type.equals("metadata.fetch_summary") ? jsonLong(rawJson, "failures")
-        : type.endsWith("failed") || type.endsWith("_failed") || type.equals("dht.error") ? 1 : 0;
-    long warnings = type.equals("dht.warning") ? jsonLong(rawJson, "occurrences") : 0;
-    if (links + queries + failures + warnings == 0) return;
-    try (PreparedStatement metric = connection.prepareStatement("INSERT INTO minute_metric(bucket,links,queries,failures,warnings) VALUES(date_trunc('minute',?::timestamptz),?,?,?,?) ON CONFLICT(bucket) DO UPDATE SET links=minute_metric.links+excluded.links,queries=minute_metric.queries+excluded.queries,failures=minute_metric.failures+excluded.failures,warnings=minute_metric.warnings+excluded.warnings")) {
-      metric.setTimestamp(1, Timestamp.from(occurredAt)); metric.setLong(2, links); metric.setLong(3, queries);
-      metric.setLong(4, failures); metric.setLong(5, warnings); metric.executeUpdate();
-    }
   }
 
-  private static long jsonLong(String json, String field) {
-    String marker = "\"" + field + "\":"; int start = json.indexOf(marker); if (start < 0) return 1; start += marker.length(); int end = start;
-    while (end < json.length() && Character.isDigit(json.charAt(end))) end++;
-    try { return Long.parseLong(json.substring(start, end)); } catch (Exception ignored) { return 1; }
+  void aggregateMonitorBatch(List<MonitorPoint> points) throws SQLException {
+    if (points == null || points.isEmpty()) return;
+    Map<Instant, long[]> buckets = new TreeMap<>();
+    for (MonitorPoint point : points) {
+      long[] delta = point.delta();
+      if (delta[0] + delta[1] + delta[2] + delta[3] == 0) continue;
+      Instant bucket = point.occurredAt().truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+      long[] total = buckets.computeIfAbsent(bucket, ignored -> new long[4]);
+      for (int index = 0; index < total.length; index++) total[index] += delta[index];
+    }
+    if (buckets.isEmpty()) return;
+    try (Connection connection = dataSource.getConnection()) {
+      connection.setAutoCommit(false);
+      try {
+        try (PreparedStatement metric = connection.prepareStatement(
+            "INSERT INTO minute_metric(bucket,links,queries,failures,warnings) VALUES(?,?,?,?,?) ON CONFLICT(bucket) DO UPDATE SET links=minute_metric.links+excluded.links,queries=minute_metric.queries+excluded.queries,failures=minute_metric.failures+excluded.failures,warnings=minute_metric.warnings+excluded.warnings")) {
+          for (var entry : buckets.entrySet()) {
+            metric.setTimestamp(1, Timestamp.from(entry.getKey()));
+            long[] values = entry.getValue();
+            for (int index = 0; index < values.length; index++) metric.setLong(index + 2, values[index]);
+            metric.addBatch();
+          }
+          metric.executeBatch();
+        }
+        connection.commit();
+      } catch (SQLException error) {
+        connection.rollback();
+        throw error;
+      }
+    }
   }
 
   boolean queueMetadataJob(String hash, Instant at, int priority, boolean accelerate) throws SQLException {
