@@ -120,6 +120,8 @@ final class DhtCollector implements AutoCloseable {
   private void onIncomingMessage(DHT dht, MessageBase message) {
     String query;
     String infoHash;
+    InetSocketAddress peerEndpoint = null;
+    InetSocketAddress sourceEndpoint = message.getOrigin();
     if (message instanceof GetPeersRequest request) {
       query = "get_peers";
       infoHash = request.getInfoHash().toString(false).toLowerCase(Locale.ROOT);
@@ -129,7 +131,8 @@ final class DhtCollector implements AutoCloseable {
       InetSocketAddress origin = request.getOrigin();
       int peerPort = request.getPort();
       if (origin != null && peerPort > 0 && peerPort <= 65535) {
-        InetSocketAddress peer = new InetSocketAddress(origin.getAddress(), peerPort);
+        peerEndpoint = new InetSocketAddress(origin.getAddress(), peerPort);
+        InetSocketAddress peer = peerEndpoint;
         announcedPeers.compute(infoHash, (ignored, existing) -> {
           Map<InetSocketAddress, PeerHint> peers = existing == null ? new LinkedHashMap<>() : new LinkedHashMap<>(existing);
           peers.put(peer, new PeerHint(peer, System.currentTimeMillis()));
@@ -140,12 +143,21 @@ final class DhtCollector implements AutoCloseable {
     } else {
       return;
     }
+    InetSocketAddress persistedPeer = peerEndpoint;
+    InetSocketAddress persistedSource = sourceEndpoint;
     queryCounts.computeIfAbsent(query, ignored -> new LongAdder()).increment();
     if (!permits.tryAcquire()) return;
     tasks.submit(() -> {
       try {
         acceptResource(infoHash, query);
-        if (query.equals("announce_peer")) startMetadataForAnnounce(infoHash);
+        if (query.equals("announce_peer")) {
+          if (persistedPeer != null) {
+            catalog.event("dht.peer_discovered", infoHash,
+                peerEventJson(infoHash, persistedPeer, persistedSource), "passive",
+                persistedPeer, persistedSource);
+          }
+          startMetadataForAnnounce(infoHash);
+        }
       } catch (Exception error) {
         System.err.println("resource observation failed: " + error.getMessage());
       } finally {
@@ -265,6 +277,18 @@ final class DhtCollector implements AutoCloseable {
   private static String jsonEscape(String value) {
     return value.replace("\\", "\\\\").replace("\"", "\\\"")
         .replace("\n", "\\n").replace("\r", "\\r");
+  }
+
+  private static String peerEventJson(String infoHash, InetSocketAddress peer, InetSocketAddress source) {
+    StringBuilder json = new StringBuilder("{\"event\":\"dht.peer_discovered\",\"info_hash\":\"")
+        .append(jsonEscape(infoHash)).append("\",\"peer\":{\"host\":\"")
+        .append(jsonEscape(peer.getHostString())).append("\",\"port\":").append(peer.getPort()).append('}');
+    if (source != null) {
+      json.append(",\"discovered_from\":{\"host\":\"")
+          .append(jsonEscape(source.getHostString())).append("\",\"port\":")
+          .append(source.getPort()).append('}');
+    }
+    return json.append('}').toString();
   }
 
   private void flushQueries() throws Exception {

@@ -3,6 +3,7 @@ package com.cocal.dht;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import java.net.URI;
+import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
@@ -130,11 +131,20 @@ final class Catalog implements AutoCloseable {
 
   void event(String type, String hash, String rawJson) throws SQLException { event(type, hash, rawJson, "passive"); }
   void event(String type, String hash, String rawJson, String mode) throws SQLException {
+    event(type, hash, rawJson, mode, null, null);
+  }
+  void event(String type, String hash, String rawJson, String mode,
+             InetSocketAddress peer, InetSocketAddress source) throws SQLException {
     Instant now = Instant.now();
     try (Connection connection = dataSource.getConnection()) {
       connection.setAutoCommit(false);
-      try (PreparedStatement statement = connection.prepareStatement("INSERT INTO probe_event(event_id,event_type,occurred_at,info_hash,mode,raw_event) VALUES(?,?,?,?,?,?::jsonb) ON CONFLICT DO NOTHING")) {
-        statement.setString(1, UUID.randomUUID().toString()); statement.setString(2, type); statement.setTimestamp(3, Timestamp.from(now)); statement.setString(4, hash); statement.setString(5, mode); statement.setString(6, rawJson);
+      try (PreparedStatement statement = connection.prepareStatement("INSERT INTO probe_event(event_id,event_type,occurred_at,info_hash,peer_host,peer_port,source_host,source_port,mode,raw_event) VALUES(?,?,?,?,?,?,?,?,?,?::jsonb) ON CONFLICT DO NOTHING")) {
+        statement.setString(1, UUID.randomUUID().toString()); statement.setString(2, type); statement.setTimestamp(3, Timestamp.from(now)); statement.setString(4, hash);
+        statement.setString(5, peer == null ? null : peer.getHostString());
+        setNullableInteger(statement, 6, peer == null ? null : peer.getPort());
+        statement.setString(7, source == null ? null : source.getHostString());
+        setNullableInteger(statement, 8, source == null ? null : source.getPort());
+        statement.setString(9, mode); statement.setString(10, rawJson);
         if (statement.executeUpdate() > 0) {
           incrementCounter(connection, "probes", 1);
           if (type.equals("dht.peer_discovered")) incrementCounter(connection, "peers", 1);
