@@ -41,12 +41,13 @@ final class MetadataFetcher implements AutoCloseable {
   private static final int DHT_PEER_COLLECTION_DELAY_MILLIS = 500;
   private final TorrentFetcher fetcher;
   private final List<DHT> dhtNodes;
-  private final DirectMetadataFetcher direct = new DirectMetadataFetcher();
+  private final DirectMetadataFetcher direct;
   private final int timeoutSeconds;
   private final BiConsumer<String, Long> metric;
   private final ConcurrentHashMap.KeySetView<TorrentFetcher.FetchTask, Boolean> activeTasks = ConcurrentHashMap.newKeySet();
   private final ConcurrentHashMap.KeySetView<PeerLookupTask, Boolean> activeLookups = ConcurrentHashMap.newKeySet();
   private final AtomicLong lookupCursor = new AtomicLong();
+  private final AtomicBoolean closing = new AtomicBoolean();
 
   MetadataFetcher(List<lbms.plugins.mldht.kad.DHT> nodes, int maxConcurrent, int timeoutSeconds) {
     this(nodes, maxConcurrent, timeoutSeconds, (ignored, value) -> { });
@@ -62,6 +63,7 @@ final class MetadataFetcher implements AutoCloseable {
     fetcher.setMaxSockets(Math.max(8, maxConcurrent * 4));
     this.timeoutSeconds = timeoutSeconds;
     this.metric = metric == null ? (ignored, value) -> { } : metric;
+    this.direct = new DirectMetadataFetcher(this.metric);
   }
 
   CompletionStage<Optional<Manifest>> fetch(String infoHash) {
@@ -136,6 +138,7 @@ final class MetadataFetcher implements AutoCloseable {
   private CompletionStage<Optional<Manifest>> fetchWithDht(String infoHash,
                                                             Collection<InetSocketAddress> preferredPeers,
                                                             int taskTimeoutSeconds) {
+    if (closing.get()) return CompletableFuture.completedFuture(Optional.empty());
     Key key = new Key(infoHash);
     metric.accept("metadata.dht_fetch_started", 1L);
     CompletableFuture<Optional<Manifest>> result = new CompletableFuture<>();
@@ -163,7 +166,7 @@ final class MetadataFetcher implements AutoCloseable {
       else result.complete(dhtResult.get());
     };
     Runnable launchDirect = () -> {
-      if (dhtPeers.isEmpty() || !directStarted.compareAndSet(false, true)) return;
+      if (closing.get() || dhtPeers.isEmpty() || !directStarted.compareAndSet(false, true)) return;
       metric.accept("metadata.dht_peers", (long) dhtPeers.size());
       long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime()
           - startNanos);
@@ -396,8 +399,9 @@ final class MetadataFetcher implements AutoCloseable {
   }
 
   @Override public void close() {
-    direct.close();
+    if (!closing.compareAndSet(false, true)) return;
     List.copyOf(activeTasks).forEach(TorrentFetcher.FetchTask::stop);
     List.copyOf(activeLookups).forEach(PeerLookupTask::kill);
+    direct.close();
   }
 }

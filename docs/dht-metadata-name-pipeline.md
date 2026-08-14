@@ -313,3 +313,47 @@ erDiagram
 若轮询分片后依旧没有 DHT peer 回调，下一步只对 priority `100` 的实时任务做
 双节点 hedged lookup；不要先全局增加 metadata concurrency，否则只会扩大 UDP、
 TCP 和数据库压力。
+
+### 6.1 入站削峰与失败 Peer 惩罚
+
+线上加速后，`announce_peer` 直取已经成为主要成功来源，但一次 PostgreSQL I/O
+抖动仍让 5 个 collector 连接全部被占用。旧路径中每个 DHT 回调都会独立申请
+连接并写 `discovered_resource`、`metadata_job` 和 `probe_event`，所以连接池等待会
+反向阻塞网络观察任务。
+
+当前入站路径调整为：
+
+```mermaid
+flowchart LR
+    UDP[DHT UDP callback] --> CACHE[24h cache / info-hash coalescing]
+    CACHE --> Q[bounded priority queue]
+    Q -->|up to 256| WRITER[single batch writer]
+    WRITER -->|one transaction| PG[(PostgreSQL)]
+    WRITER -->|announce job committed| FAST[direct BEP-9 fetch]
+```
+
+- 队列容量为 `max(2048, max-concurrent * 64)`，默认生产配置是 10,240。
+- 相同 info-hash 在队列中合并，`announce_peer` 会升级并移动到队首。
+- 队列满时先淘汰最早的 `get_peers`；只有全部都是 announce 时才淘汰最早 announce。
+- 数据库失败时整批回队并退避 500ms，避免每个观察各自等待连接。
+- `collector.observation_queue_depth`、`collector.observation_dropped` 和
+  `collector.observation_retry` 用于监控削峰效果。
+
+直接 Peer 获取还维护一个 `(info-hash, peer endpoint)` 短期负缓存。连接失败暂停
+5 分钟，不支持扩展协议或反复拒绝 metadata 暂停 15 分钟，返回错误 info-hash
+暂停 30 分钟。这样 direct miss 进入 DHT fallback 后不会立即重拨同一个坏 Peer，
+同时不会因为一个种子失败而屏蔽该 Peer 上的其他种子。失败阶段通过
+`metadata.peer.*` 监控日志发送到 Monitor Center。
+
+连接超时根据候选数自适应：少于 4 个候选时保留 3 秒，避免错过唯一的新鲜
+announce Peer；达到 4 个候选时单连接上限降为 1.5 秒，通过并行候选更快跳过
+不可达地址。
+
+BEP 51 `sample_infohashes` 仍保持关闭。当前 mldht 依赖已经支持该 RPC，但它扩大
+的是发现覆盖面；应先验证批量写入在至少 24 小时内没有队列增长或连接池超时，
+再考虑用一个独立 DHT 节点低速采样。
+
+2026-08-14 部署后的首个 110 秒观察窗口中，批量链路记录 1,096 个新资源并新增
+23 条 content，观察队列深度从 6 降到 2；没有 observation drop/retry、连接池
+超时或 collector failure。Peer 负缓存跳过了 183 次重复拨号。该窗口用于确认
+链路和背压行为，不替代后续 24 小时吞吐基线。

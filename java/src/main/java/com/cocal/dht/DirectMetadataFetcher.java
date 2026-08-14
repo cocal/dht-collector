@@ -4,8 +4,10 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -23,7 +25,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 
 /** Fetches BEP-9 metadata directly from peers learned from announce_peer. */
 final class DirectMetadataFetcher implements AutoCloseable {
@@ -35,25 +39,60 @@ final class DirectMetadataFetcher implements AutoCloseable {
   private static final int MAX_FRAME_BYTES = MAX_METADATA_BYTES + 64 * 1024;
   static final int MAX_PEERS_PER_FETCH = 12;
   private static final int PEER_BATCH_SIZE = 4;
+  private static final int DEFAULT_CONNECT_TIMEOUT_MILLIS = 3_000;
+  private static final int HEDGED_CONNECT_TIMEOUT_MILLIS = 1_500;
+  private static final long TRANSIENT_PENALTY_MILLIS = TimeUnit.MINUTES.toMillis(5);
+  private static final long PROTOCOL_PENALTY_MILLIS = TimeUnit.MINUTES.toMillis(15);
+  private static final long HASH_MISMATCH_PENALTY_MILLIS = TimeUnit.MINUTES.toMillis(30);
   private static final byte[] PROTOCOL = "BitTorrent protocol".getBytes(StandardCharsets.ISO_8859_1);
+
+  private enum Stage { CONNECT, HANDSHAKE, EXTENSION, METADATA }
+
+  private static final class PeerFetchException extends IOException {
+    private final String reason;
+    private final long penaltyMillis;
+
+    PeerFetchException(String reason, long penaltyMillis, Throwable cause) {
+      super(cause == null ? reason : cause.getMessage(), cause);
+      this.reason = reason;
+      this.penaltyMillis = penaltyMillis;
+    }
+  }
 
   private final ExecutorService workers = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
   private final SecureRandom random = new SecureRandom();
   private final Set<Socket> activeSockets = java.util.concurrent.ConcurrentHashMap.newKeySet();
+  private final PeerPenaltyCache penalties = new PeerPenaltyCache();
+  private final BiConsumer<String, Long> metric;
+
+  DirectMetadataFetcher() { this((ignored, value) -> { }); }
+
+  DirectMetadataFetcher(BiConsumer<String, Long> metric) {
+    this.metric = metric == null ? (ignored, value) -> { } : metric;
+  }
 
   CompletionStage<Optional<byte[]>> fetch(String infoHash, Collection<InetSocketAddress> peers,
                                           int timeoutSeconds) {
-    List<InetSocketAddress> candidates = peers == null ? List.of() : peers.stream()
+    List<InetSocketAddress> supplied = peers == null ? List.of() : peers.stream()
         .filter(peer -> peer != null && peer.getAddress() != null && peer.getPort() > 0 && peer.getPort() <= 65535)
         .distinct().limit(MAX_PEERS_PER_FETCH).toList();
+    long nowMillis = System.currentTimeMillis();
+    List<InetSocketAddress> candidates = supplied.stream()
+        .filter(peer -> !penalties.isPenalized(infoHash, peer, nowMillis)).toList();
+    int skipped = supplied.size() - candidates.size();
+    if (skipped > 0) metric.accept("metadata.peer.penalty_skipped", (long) skipped);
     if (candidates.isEmpty()) return CompletableFuture.completedFuture(Optional.empty());
     long timeoutMillis = Math.max(1_000L, timeoutSeconds * 1_000L);
     long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+    int connectTimeoutMillis = connectTimeoutMillis(candidates.size());
     CompletableFuture<Optional<byte[]>> result = new CompletableFuture<>();
+    AtomicBoolean timedOut = new AtomicBoolean();
     List<Future<?>> tasks = new CopyOnWriteArrayList<>();
     Set<Socket> fetchSockets = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    launchBatch(infoHash, candidates, 0, deadline, result, tasks, fetchSockets);
+    launchBatch(infoHash, candidates, 0, deadline, connectTimeoutMillis,
+        result, tasks, fetchSockets, timedOut);
     CompletableFuture.delayedExecutor(timeoutMillis, TimeUnit.MILLISECONDS).execute(() -> {
+      timedOut.set(true);
       if (result.complete(Optional.empty())) {
         closeSockets(fetchSockets);
         tasks.forEach(task -> task.cancel(true));
@@ -63,8 +102,10 @@ final class DirectMetadataFetcher implements AutoCloseable {
   }
 
   private void launchBatch(String infoHash, List<InetSocketAddress> candidates, int offset,
-                           long deadline, CompletableFuture<Optional<byte[]>> result,
-                           List<Future<?>> tasks, Set<Socket> fetchSockets) {
+                           long deadline, int connectTimeoutMillis,
+                           CompletableFuture<Optional<byte[]>> result,
+                           List<Future<?>> tasks, Set<Socket> fetchSockets,
+                           AtomicBoolean timedOut) {
     if (result.isDone()) return;
     if (offset >= candidates.size() || System.nanoTime() >= deadline) {
       if (result.complete(Optional.empty())) closeSockets(fetchSockets);
@@ -76,13 +117,18 @@ final class DirectMetadataFetcher implements AutoCloseable {
       InetSocketAddress peer = candidates.get(index);
       tasks.add(workers.submit(() -> {
         try {
-          byte[] metadata = fetchPeer(infoHash, peer, deadline, fetchSockets);
-          if (metadata != null && result.complete(Optional.of(metadata))) closeSockets(fetchSockets);
-        } catch (Exception ignored) {
-          // A DHT peer is untrusted and often does not expose BEP-9. Try the next peer.
+          byte[] metadata = fetchPeer(infoHash, peer, deadline, connectTimeoutMillis, fetchSockets);
+          if (metadata != null) {
+            penalties.clear(infoHash, peer);
+            metric.accept("metadata.peer.completed", 1L);
+            if (result.complete(Optional.of(metadata))) closeSockets(fetchSockets);
+          }
+        } catch (Exception error) {
+          if (!result.isDone() || timedOut.get()) recordFailure(infoHash, peer, error);
         } finally {
           if (remaining.decrementAndGet() == 0 && !result.isDone()) {
-            launchBatch(infoHash, candidates, end, deadline, result, tasks, fetchSockets);
+            launchBatch(infoHash, candidates, end, deadline, connectTimeoutMillis,
+                result, tasks, fetchSockets, timedOut);
           }
         }
       }));
@@ -90,15 +136,18 @@ final class DirectMetadataFetcher implements AutoCloseable {
   }
 
   private byte[] fetchPeer(String infoHash, InetSocketAddress peer, long deadline,
-                           Set<Socket> fetchSockets) throws Exception {
+                           int connectTimeoutMillis,
+                           Set<Socket> fetchSockets) throws PeerFetchException {
     Socket socket = new Socket();
+    Stage stage = Stage.CONNECT;
     try (socket) {
       activeSockets.add(socket);
       fetchSockets.add(socket);
       socket.setTcpNoDelay(true);
       socket.setKeepAlive(false);
       long remainingMillis = remainingMillis(deadline);
-      socket.connect(peer, timeoutMillisToInt(Math.min(remainingMillis, 3_000L)));
+      socket.connect(peer, timeoutMillisToInt(Math.min(remainingMillis, connectTimeoutMillis)));
+      stage = Stage.HANDSHAKE;
       socket.setSoTimeout(timeoutMillisToInt(Math.min(remainingMillis, 5_000L)));
       DataInputStream input = new DataInputStream(socket.getInputStream());
       DataOutputStream output = new DataOutputStream(socket.getOutputStream());
@@ -114,6 +163,7 @@ final class DirectMetadataFetcher implements AutoCloseable {
 
       byte[] handshake = readFully(input, socket, HANDSHAKE_LENGTH, deadline);
       validateHandshake(handshake, expectedHash);
+      stage = Stage.EXTENSION;
       sendExtendedHandshake(output);
 
       int metadataExtension = 1; // ID advertised in our extended handshake.
@@ -151,9 +201,11 @@ final class DirectMetadataFetcher implements AutoCloseable {
               sendMetadataRequest(output, requestExtension, piece);
             }
             pipelineInitialized = true;
+            stage = Stage.METADATA;
           } else {
             sendMetadataRequest(output, requestExtension, 0);
             nextPiece = 1;
+            stage = Stage.METADATA;
           }
           continue;
         }
@@ -206,10 +258,57 @@ final class DirectMetadataFetcher implements AutoCloseable {
         }
       }
       throw new IOException("metadata peer timeout");
+    } catch (Exception error) {
+      if (error instanceof PeerFetchException peerError) throw peerError;
+      throw classify(stage, error);
     } finally {
       fetchSockets.remove(socket);
       activeSockets.remove(socket);
     }
+  }
+
+  private void recordFailure(String infoHash, InetSocketAddress peer, Exception error) {
+    PeerFetchException failure = error instanceof PeerFetchException peerError
+        ? peerError : classify(Stage.METADATA, error);
+    penalties.penalize(infoHash, peer, System.currentTimeMillis(), failure.penaltyMillis);
+    metric.accept("metadata.peer." + failure.reason, 1L);
+  }
+
+  static int connectTimeoutMillis(int candidateCount) {
+    return candidateCount >= PEER_BATCH_SIZE
+        ? HEDGED_CONNECT_TIMEOUT_MILLIS : DEFAULT_CONNECT_TIMEOUT_MILLIS;
+  }
+
+  private static PeerFetchException classify(Stage stage, Throwable error) {
+    String message = error.getMessage() == null ? "" : error.getMessage().toLowerCase(java.util.Locale.ROOT);
+    if (stage == Stage.CONNECT) {
+      if (error instanceof SocketTimeoutException || message.contains("timed out") || message.contains("timeout")) {
+        return new PeerFetchException("connect_timeout", TRANSIENT_PENALTY_MILLIS, error);
+      }
+      if (error instanceof ConnectException && message.contains("refused")) {
+        return new PeerFetchException("connect_refused", TRANSIENT_PENALTY_MILLIS, error);
+      }
+      return new PeerFetchException("connect_failed", TRANSIENT_PENALTY_MILLIS, error);
+    }
+    if (message.contains("hash mismatch") || message.contains("unexpected infohash")) {
+      return new PeerFetchException("hash_mismatch", HASH_MISMATCH_PENALTY_MILLIS, error);
+    }
+    if (message.contains("does not support ut_metadata") || message.contains("lacks extension protocol")) {
+      return new PeerFetchException("extension_unsupported", PROTOCOL_PENALTY_MILLIS, error);
+    }
+    if (message.contains("rejected metadata")) {
+      return new PeerFetchException("metadata_rejected", PROTOCOL_PENALTY_MILLIS, error);
+    }
+    if (message.contains("timeout") || error instanceof SocketTimeoutException) {
+      return new PeerFetchException(stage.name().toLowerCase(java.util.Locale.ROOT) + "_timeout",
+          TRANSIENT_PENALTY_MILLIS, error);
+    }
+    if (error instanceof EOFException || message.contains("closed connection")) {
+      return new PeerFetchException(stage.name().toLowerCase(java.util.Locale.ROOT) + "_closed",
+          TRANSIENT_PENALTY_MILLIS, error);
+    }
+    return new PeerFetchException(stage.name().toLowerCase(java.util.Locale.ROOT) + "_failed",
+        stage == Stage.METADATA ? PROTOCOL_PENALTY_MILLIS : TRANSIENT_PENALTY_MILLIS, error);
   }
 
   private static void validateHandshake(byte[] handshake, byte[] expectedHash) throws IOException {

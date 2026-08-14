@@ -39,6 +39,8 @@ final class DhtCollector implements AutoCloseable {
   static final int DIRECT_FALLBACK_PRIORITY = LIVE_METADATA_PRIORITY;
   static final int DIRECT_FALLBACK_DELAY_SECONDS = 5;
   static final int MAX_ANNOUNCE_ENDPOINTS = 6;
+  static final int OBSERVATION_BATCH_SIZE = 256;
+  static final long OBSERVATION_FLUSH_MILLIS = 100;
   private static final long INCOMING_NODE_PROBE_INTERVAL_NANOS =
       TimeUnit.MILLISECONDS.toNanos(250);
 
@@ -52,8 +54,8 @@ final class DhtCollector implements AutoCloseable {
   private final ArrayList<DHT> nodes = new ArrayList<>();
   private final ExecutorService tasks = Executors.newVirtualThreadPerTaskExecutor();
   private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-  private final Semaphore permits;
   private final Semaphore metadataPermits;
+  private final DhtObservationQueue observationQueue;
   private final MetadataFetcher metadata;
   private final Map<String, Instant> pendingTouches = new ConcurrentHashMap<>();
   private final Map<String, Map<InetSocketAddress, PeerHint>> announcedPeers = new ConcurrentHashMap<>();
@@ -63,6 +65,7 @@ final class DhtCollector implements AutoCloseable {
   private final Map<DHT, AtomicLong> incomingNodeProbeGates = new ConcurrentHashMap<>();
   private final AtomicLong peerSequence = new AtomicLong();
   private final AtomicLong discovered;
+  private volatile Thread observationWriter;
   private volatile boolean stopping;
 
   DhtCollector(Config config, Catalog catalog) throws Exception {
@@ -78,7 +81,7 @@ final class DhtCollector implements AutoCloseable {
       monitor.close();
       throw error;
     }
-    this.permits = new Semaphore(config.maxConcurrent());
+    this.observationQueue = new DhtObservationQueue(Math.max(2_048, config.maxConcurrent() * 64));
     this.metadataPermits = new Semaphore(config.metadataConcurrent());
     Files.createDirectories(config.storagePath());
     try {
@@ -101,6 +104,9 @@ final class DhtCollector implements AutoCloseable {
   }
 
   void start() {
+    if (observationWriter == null) {
+      observationWriter = Thread.ofVirtual().name("dht-observation-writer").start(this::drainObservations);
+    }
     scheduler.scheduleWithFixedDelay(() -> {
       try {
         flushTouches();
@@ -132,6 +138,10 @@ final class DhtCollector implements AutoCloseable {
       long queuedTasks = metadata.queuedDhtTasks();
       if (activeTasks > 0) monitor.metric("metadata.dht_tasks_active", activeTasks);
       if (queuedTasks > 0) monitor.metric("metadata.dht_tasks_queued", queuedTasks);
+      int observationDepth = observationQueue.size();
+      if (observationDepth > 0) monitor.metric("collector.observation_queue_depth", observationDepth);
+      long droppedObservations = observationQueue.droppedSinceLastReport();
+      if (droppedObservations > 0) monitor.metric("collector.observation_dropped", droppedObservations);
     }, 30, 60, TimeUnit.SECONDS);
     scheduler.scheduleWithFixedDelay(() -> {
       try { catalog.markInvalidResources(Instant.now().minus(Duration.ofDays(7))); }
@@ -186,53 +196,58 @@ final class DhtCollector implements AutoCloseable {
     InetSocketAddress persistedSource = sourceEndpoint;
     seedRoutingTable(dht, sourceEndpoint);
     queryCounts.computeIfAbsent(query, ignored -> new LongAdder()).increment();
-    if (!permits.tryAcquire()) return;
-    tasks.submit(() -> {
-      try {
-        boolean metadataNeeded = acceptResource(infoHash, query);
-        if (query.equals("announce_peer")) {
-          if (metadataNeeded) startMetadataForAnnounce(infoHash);
-          if (persistedPeer != null) {
-            catalog.event("dht.peer_discovered", infoHash,
-                peerEventJson(infoHash, persistedPeer, persistedSource), "passive",
-                persistedPeer, persistedSource);
-          }
-        }
-      } catch (Exception error) {
-        monitor.metric("collector.failed", 1);
-        System.err.println("resource observation failed: " + error.getMessage());
-      } finally {
-        permits.release();
-      }
-    });
+    enqueueObservation(new DhtObservation(infoHash, Instant.now(), query, persistedPeer, persistedSource));
   }
 
-  private boolean acceptResource(String infoHash, String query) throws Exception {
-    long nowMillis = System.currentTimeMillis();
-    Instant now = Instant.ofEpochMilli(nowMillis);
-    if (cache.contains(infoHash, nowMillis)) {
-      cache.observe(infoHash, nowMillis);
-      pendingTouches.put(infoHash, now);
-      return query.equals("announce_peer") && catalog.queueMetadataJob(infoHash, now, 100, true);
+  private void enqueueObservation(DhtObservation observation) {
+    long observedAt = observation.observedAt().toEpochMilli();
+    if (cache.contains(observation.infoHash(), observedAt)) {
+      cache.observe(observation.infoHash(), observedAt);
+      if (!observation.isAnnounce()) {
+        pendingTouches.put(observation.infoHash(), observation.observedAt());
+        return;
+      }
+    } else if (config.maxResources() > 0 && discovered.get() >= config.maxResources()) {
+      return;
     }
-    if (config.maxResources() > 0 && discovered.get() >= config.maxResources() && !catalog.exists(infoHash)) return false;
-    cache.observe(infoHash, nowMillis);
-    boolean fresh;
-    try {
-      fresh = catalog.claim(infoHash, now, query);
-    } catch (Exception error) {
-      cache.remove(infoHash);
-      throw error;
+    observationQueue.offer(observation);
+  }
+
+  private void drainObservations() {
+    while (!stopping || !observationQueue.isEmpty()) {
+      List<DhtObservation> batch;
+      try {
+        batch = observationQueue.drain(OBSERVATION_BATCH_SIZE, OBSERVATION_FLUSH_MILLIS);
+      } catch (InterruptedException interrupted) {
+        Thread.currentThread().interrupt();
+        return;
+      }
+      if (batch.isEmpty()) continue;
+      try {
+        Catalog.ObservationWrite write = catalog.persistObservations(batch);
+        long persistedAt = System.currentTimeMillis();
+        for (DhtObservation observation : batch) {
+          cache.observe(observation.infoHash(), Math.max(persistedAt, observation.observedAt().toEpochMilli()));
+        }
+        int fresh = write.freshHashes().size();
+        if (fresh > 0) {
+          discovered.addAndGet(fresh);
+          monitor.metric("dht.resource_discovered", fresh);
+        }
+        if (!stopping) write.immediateHashes().forEach(this::startMetadataForAnnounce);
+      } catch (Exception error) {
+        monitor.metric("collector.failed", 1);
+        monitor.metric("collector.observation_retry", batch.size());
+        System.err.println("observation batch persistence failed: " + error.getMessage());
+        if (stopping) return;
+        observationQueue.requeue(batch);
+        try { Thread.sleep(500); }
+        catch (InterruptedException interrupted) {
+          Thread.currentThread().interrupt();
+          return;
+        }
+      }
     }
-    if (fresh) {
-      discovered.incrementAndGet();
-      monitor.metric("dht.resource_discovered", 1);
-      catalog.event("dht.resource_discovered", infoHash,
-          "{\"event\":\"dht.resource_discovered\",\"info_hash\":\"" + infoHash
-              + "\",\"query\":\"" + query + "\"}");
-    }
-    boolean queued = catalog.queueMetadataJob(infoHash, now, query.equals("announce_peer") ? 100 : 10, query.equals("announce_peer"));
-    return query.equals("announce_peer") && queued;
   }
 
   private void flushTouches() throws Exception {
@@ -482,18 +497,6 @@ final class DhtCollector implements AutoCloseable {
         .replace("\n", "\\n").replace("\r", "\\r");
   }
 
-  private static String peerEventJson(String infoHash, InetSocketAddress peer, InetSocketAddress source) {
-    StringBuilder json = new StringBuilder("{\"event\":\"dht.peer_discovered\",\"info_hash\":\"")
-        .append(jsonEscape(infoHash)).append("\",\"peer\":{\"host\":\"")
-        .append(jsonEscape(peer.getHostString())).append("\",\"port\":").append(peer.getPort()).append('}');
-    if (source != null) {
-      json.append(",\"discovered_from\":{\"host\":\"")
-          .append(jsonEscape(source.getHostString())).append("\",\"port\":")
-          .append(source.getPort()).append('}');
-    }
-    return json.append('}').toString();
-  }
-
   private void flushQueries() throws Exception {
     for (var entry : queryCounts.entrySet()) {
       long count = entry.getValue().sumThenReset();
@@ -509,9 +512,16 @@ final class DhtCollector implements AutoCloseable {
   @Override public void close() {
     if (stopping) return;
     stopping = true;
-    metadata.close();
     nodes.forEach(DHT::stop);
     scheduler.shutdownNow();
+    observationQueue.close();
+    Thread writer = observationWriter;
+    if (writer != null) {
+      try { writer.join(5_000); }
+      catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+      if (writer.isAlive()) writer.interrupt();
+    }
+    metadata.close();
     tasks.close();
     try {
       flushTouches();

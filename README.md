@@ -138,7 +138,10 @@ The Java service uses the existing PostgreSQL catalog, including
 `discovered_resource`, `probe_event`, `metadata_job`, `content`, and
 `file_entry`. It keeps only resources seen in the last 24 hours resident,
 claims metadata retries from the database, verifies the BEP 9 info dictionary,
-and writes searchable content. Generic unit templates are in
+and writes searchable content. Incoming DHT observations are coalesced by
+info-hash in a bounded priority queue; fresh `announce_peer` observations are
+kept ahead of `get_peers` traffic and persisted in batches of up to 256 using
+one database transaction. Generic unit templates are in
 `deploy/dht-passive-collector-java.service` and
 `deploy/dht-search-dashboard-java.service`; adjust paths and the private
 environment-file location for the target host. The environment file must stay
@@ -160,7 +163,16 @@ can be sent directly to the event log described in
 - `metadata.fetch_started`
 - `metadata.fetch_completed`
 - `metadata.fetch_failed`
+- `metadata.peer.connect_timeout`
+- `metadata.peer.connect_refused`
+- `metadata.peer.extension_unsupported`
+- `metadata.peer.metadata_timeout`
+- `metadata.peer.hash_mismatch`
+- `metadata.peer.penalty_skipped`
 - `content.indexed`
+- `collector.observation_queue_depth`
+- `collector.observation_dropped`
+- `collector.observation_retry`
 - `collector.snapshot`
 - `collector.failed`
 

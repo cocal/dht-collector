@@ -19,6 +19,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -34,6 +35,7 @@ final class Catalog implements AutoCloseable {
   private final Map<String, AtomicLong> pendingCounters = new ConcurrentHashMap<>();
 
   record ManifestWrite(boolean inserted, boolean changed) {}
+  record ObservationWrite(Set<String> freshHashes, Set<String> immediateHashes) {}
 
   Catalog(String url, String user, String password, int poolSize) {
     URI parsed = parseUri(url);
@@ -151,6 +153,154 @@ final class Catalog implements AutoCloseable {
       } catch (SQLException error) { connection.rollback(); throw error; }
       finally { connection.setAutoCommit(true); }
     }
+  }
+
+  /** Persist a coalesced DHT intake batch in one transaction and one pooled connection. */
+  ObservationWrite persistObservations(List<DhtObservation> observations) throws SQLException {
+    if (observations == null || observations.isEmpty()) {
+      return new ObservationWrite(Set.of(), Set.of());
+    }
+    var fresh = new java.util.LinkedHashSet<String>();
+    var immediate = new java.util.LinkedHashSet<String>();
+    int peerFacts = 0;
+    int factCount = 0;
+    try (Connection connection = dataSource.getConnection()) {
+      connection.setAutoCommit(false);
+      try {
+        int[] inserted;
+        try (PreparedStatement statement = connection.prepareStatement(
+            "INSERT INTO discovered_resource(info_hash,first_seen_at,last_seen_at,source,state) "
+                + "VALUES(?,?,?,?,'active') ON CONFLICT(info_hash) DO NOTHING")) {
+          for (DhtObservation observation : observations) {
+            Timestamp at = Timestamp.from(observation.observedAt());
+            statement.setString(1, observation.infoHash());
+            statement.setTimestamp(2, at);
+            statement.setTimestamp(3, at);
+            statement.setString(4, observation.query());
+            statement.addBatch();
+          }
+          inserted = statement.executeBatch();
+        }
+        for (int index = 0; index < inserted.length; index++) {
+          if (statementChanged(inserted[index])) fresh.add(observations.get(index).infoHash());
+        }
+
+        try (PreparedStatement statement = connection.prepareStatement(
+            "UPDATE discovered_resource SET last_seen_at=greatest(last_seen_at,?),state='active' "
+                + "WHERE info_hash=?")) {
+          for (DhtObservation observation : observations) {
+            statement.setTimestamp(1, Timestamp.from(observation.observedAt()));
+            statement.setString(2, observation.infoHash());
+            statement.addBatch();
+          }
+          statement.executeBatch();
+        }
+
+        int[] queued;
+        try (PreparedStatement statement = connection.prepareStatement(
+            "INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at) "
+                + "SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) "
+                + "ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,excluded.priority),"
+                + "next_attempt_at=CASE WHEN ? THEN least(metadata_job.next_attempt_at,excluded.next_attempt_at) "
+                + "ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at")) {
+          for (DhtObservation observation : observations) {
+            int priority = observation.isAnnounce() ? 100 : 10;
+            Timestamp at = Timestamp.from(observation.observedAt());
+            statement.setString(1, observation.infoHash());
+            statement.setInt(2, priority);
+            statement.setInt(3, 0);
+            statement.setTimestamp(4, at);
+            statement.setTimestamp(5, at);
+            statement.setString(6, observation.infoHash());
+            statement.setBoolean(7, observation.isAnnounce());
+            statement.addBatch();
+          }
+          queued = statement.executeBatch();
+        }
+        for (int index = 0; index < queued.length; index++) {
+          DhtObservation observation = observations.get(index);
+          if (observation.isAnnounce() && statementChanged(queued[index])) {
+            immediate.add(observation.infoHash());
+          }
+        }
+
+        try (PreparedStatement statement = connection.prepareStatement(
+            "INSERT INTO probe_event(event_id,event_type,occurred_at,info_hash,peer_host,peer_port,"
+                + "source_host,source_port,mode,raw_event) VALUES(?,?,?,?,?,?,?,?,?,?::jsonb) "
+                + "ON CONFLICT DO NOTHING")) {
+          for (DhtObservation observation : observations) {
+            if (fresh.contains(observation.infoHash())) {
+              bindObservationFact(statement, "dht.resource_discovered", observation,
+                  null, resourceObservationJson(observation));
+              statement.addBatch();
+              factCount++;
+            }
+            if (observation.isAnnounce() && observation.peer() != null) {
+              bindObservationFact(statement, "dht.peer_discovered", observation,
+                  observation.peer(), peerObservationJson(observation));
+              statement.addBatch();
+              factCount++;
+              peerFacts++;
+            }
+          }
+          if (factCount > 0) statement.executeBatch();
+        }
+        connection.commit();
+      } catch (SQLException error) {
+        connection.rollback();
+        throw error;
+      } finally {
+        connection.setAutoCommit(true);
+      }
+    }
+    queueCounter("discovered", fresh.size());
+    queueCounter("probes", factCount);
+    queueCounter("peers", peerFacts);
+    return new ObservationWrite(Set.copyOf(fresh), Set.copyOf(immediate));
+  }
+
+  private static boolean statementChanged(int count) {
+    return count > 0 || count == Statement.SUCCESS_NO_INFO;
+  }
+
+  private static void bindObservationFact(PreparedStatement statement, String type,
+                                          DhtObservation observation, InetSocketAddress peer,
+                                          String rawJson) throws SQLException {
+    InetSocketAddress source = observation.source();
+    statement.setString(1, UUID.randomUUID().toString());
+    statement.setString(2, type);
+    statement.setTimestamp(3, Timestamp.from(observation.observedAt()));
+    statement.setString(4, observation.infoHash());
+    statement.setString(5, peer == null ? null : peer.getHostString());
+    setNullableInteger(statement, 6, peer == null ? null : peer.getPort());
+    statement.setString(7, source == null ? null : source.getHostString());
+    setNullableInteger(statement, 8, source == null ? null : source.getPort());
+    statement.setString(9, "passive");
+    statement.setString(10, rawJson);
+  }
+
+  private static String resourceObservationJson(DhtObservation observation) {
+    return "{\"event\":\"dht.resource_discovered\",\"info_hash\":\""
+        + observation.infoHash() + "\",\"query\":\"" + observation.query() + "\"}";
+  }
+
+  private static String peerObservationJson(DhtObservation observation) {
+    InetSocketAddress peer = observation.peer();
+    StringBuilder json = new StringBuilder("{\"event\":\"dht.peer_discovered\",\"info_hash\":\"")
+        .append(observation.infoHash()).append("\",\"peer\":{\"host\":\"")
+        .append(jsonEscape(peer.getHostString())).append("\",\"port\":").append(peer.getPort()).append('}');
+    InetSocketAddress source = observation.source();
+    if (source != null) {
+      json.append(",\"discovered_from\":{\"host\":\"")
+          .append(jsonEscape(source.getHostString())).append("\",\"port\":")
+          .append(source.getPort()).append('}');
+    }
+    return json.append('}').toString();
+  }
+
+  private static String jsonEscape(String value) {
+    return value.replace("\\", "\\\\").replace("\"", "\\\"")
+        .replace("\n", "\\n").replace("\r", "\\r");
   }
 
   void event(String type, String hash, String rawJson) throws SQLException { event(type, hash, rawJson, "passive"); }

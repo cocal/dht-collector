@@ -1,6 +1,7 @@
 package com.cocal.dht;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -18,11 +19,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
 
 final class DirectMetadataFetcherTest {
   private static final int PIECE_SIZE = 16 * 1024;
+
+  @Test
+  void shortensConnectTimeoutWhenItCanHedgeAcrossAPeerBatch() {
+    assertEquals(3_000, DirectMetadataFetcher.connectTimeoutMillis(3));
+    assertEquals(1_500, DirectMetadataFetcher.connectTimeoutMillis(4));
+  }
 
   @Test
   void oneFetchTimeoutDoesNotCloseAnotherFetchSockets() throws Exception {
@@ -81,6 +89,23 @@ final class DirectMetadataFetcherTest {
 
       assertTrue(result.isPresent());
       assertArrayEquals(metadata, result.orElseThrow());
+    }
+  }
+
+  @Test
+  void skipsARecentlyFailedPeerAndReportsItsFailureStage() throws Exception {
+    Map<String, Long> metrics = new ConcurrentHashMap<>();
+    InetSocketAddress unavailable;
+    try (ServerSocket server = server()) { unavailable = endpoint(server); }
+    try (var fetcher = new DirectMetadataFetcher(
+        (metric, value) -> metrics.merge(metric, value, Long::sum))) {
+      assertTrue(fetcher.fetch("0".repeat(40), List.of(unavailable), 2)
+          .toCompletableFuture().get(4, TimeUnit.SECONDS).isEmpty());
+      assertTrue(metrics.keySet().stream().anyMatch(metric -> metric.startsWith("metadata.peer.connect_")));
+
+      assertTrue(fetcher.fetch("0".repeat(40), List.of(unavailable), 2)
+          .toCompletableFuture().get(4, TimeUnit.SECONDS).isEmpty());
+      assertEquals(1L, metrics.getOrDefault("metadata.peer.penalty_skipped", 0L));
     }
   }
 
