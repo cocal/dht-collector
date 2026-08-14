@@ -49,7 +49,7 @@ final class DashboardServer implements AutoCloseable {
 
   private Map<String,Object> dashboard(int limit) throws Exception {
     List<Map<String,Object>> buckets = catalog.trend(5);
-    Instant to = Instant.now().truncatedTo(ChronoUnit.MINUTES).plus(1, ChronoUnit.MINUTES);
+    Instant to = Instant.now().truncatedTo(ChronoUnit.MINUTES);
     Map<String,Object> trend = new LinkedHashMap<>();
     trend.put("from", to.minus(5, ChronoUnit.MINUTES).toString());
     trend.put("to", to.toString());

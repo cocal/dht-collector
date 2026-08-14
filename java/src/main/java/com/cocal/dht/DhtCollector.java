@@ -9,6 +9,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -32,8 +33,17 @@ import lbms.plugins.mldht.kad.messages.MessageBase;
 final class DhtCollector implements AutoCloseable {
   static final long CACHE_TTL_MS = Duration.ofHours(24).toMillis();
   static final long ANNOUNCE_PEER_TTL_MS = Duration.ofMinutes(10).toMillis();
+  static final int LIVE_METADATA_PRIORITY = 100;
+  static final int LIVE_METADATA_TIMEOUT_SECONDS = 30;
+  static final int LIVE_DIRECT_TIMEOUT_SECONDS = 10;
+  static final int DIRECT_FALLBACK_PRIORITY = LIVE_METADATA_PRIORITY;
+  static final int DIRECT_FALLBACK_DELAY_SECONDS = 5;
+  static final int MAX_ANNOUNCE_ENDPOINTS = 6;
+  private static final long INCOMING_NODE_PROBE_INTERVAL_NANOS =
+      TimeUnit.MILLISECONDS.toNanos(250);
 
-  private record PeerHint(InetSocketAddress address, long observedAt) {}
+  private record PeerHint(InetSocketAddress address, long observedAt, long sequence) {}
+  private record PeerSnapshot(List<InetSocketAddress> addresses, long sequence) {}
 
   private final Config config;
   private final Catalog catalog;
@@ -48,7 +58,10 @@ final class DhtCollector implements AutoCloseable {
   private final Map<String, Instant> pendingTouches = new ConcurrentHashMap<>();
   private final Map<String, Map<InetSocketAddress, PeerHint>> announcedPeers = new ConcurrentHashMap<>();
   private final Map<String, Boolean> runningMetadata = new ConcurrentHashMap<>();
+  private final Map<String, Boolean> runningDirectMetadata = new ConcurrentHashMap<>();
   private final Map<String, LongAdder> queryCounts = new ConcurrentHashMap<>();
+  private final Map<DHT, AtomicLong> incomingNodeProbeGates = new ConcurrentHashMap<>();
+  private final AtomicLong peerSequence = new AtomicLong();
   private final AtomicLong discovered;
   private volatile boolean stopping;
 
@@ -76,7 +89,8 @@ final class DhtCollector implements AutoCloseable {
         dht.start(configuration(port, config.storagePath().resolve("node-" + port)));
         nodes.add(dht);
       }
-      metadata = new MetadataFetcher(nodes, config.metadataConcurrent(), config.metadataTimeoutSeconds());
+      metadata = new MetadataFetcher(nodes, config.metadataConcurrent(), config.metadataTimeoutSeconds(),
+          monitor::metric);
     } catch (Exception error) {
       nodes.forEach(DHT::stop);
       scheduler.shutdownNow();
@@ -98,12 +112,27 @@ final class DhtCollector implements AutoCloseable {
       }
     }, 30, 30, TimeUnit.SECONDS);
     scheduler.scheduleWithFixedDelay(() -> {
+      try { catalog.flushCounters(); }
+      catch (Exception error) {
+        monitor.metric("collector.failed", 1);
+        System.err.println("catalog counter flush failed: " + error.getMessage());
+      }
+    }, 5, 5, TimeUnit.SECONDS);
+    scheduler.scheduleWithFixedDelay(() -> {
       try { pollMetadataJobs(); }
       catch (Exception error) {
         monitor.metric("collector.failed", 1);
         System.err.println("metadata job poll failed: " + error.getMessage());
       }
     }, 5, 5, TimeUnit.SECONDS);
+    scheduler.scheduleWithFixedDelay(() -> {
+      long routingNodes = nodes.stream().mapToLong(node -> node.getNode().getNumEntriesInRoutingTable()).sum();
+      if (routingNodes > 0) monitor.metric("dht.routing_nodes", routingNodes);
+      long activeTasks = metadata.activeDhtTasks();
+      long queuedTasks = metadata.queuedDhtTasks();
+      if (activeTasks > 0) monitor.metric("metadata.dht_tasks_active", activeTasks);
+      if (queuedTasks > 0) monitor.metric("metadata.dht_tasks_queued", queuedTasks);
+    }, 30, 60, TimeUnit.SECONDS);
     scheduler.scheduleWithFixedDelay(() -> {
       try { catalog.markInvalidResources(Instant.now().minus(Duration.ofDays(7))); }
       catch (Exception error) {
@@ -145,33 +174,29 @@ final class DhtCollector implements AutoCloseable {
       infoHash = request.getInfoHash().toString(false).toLowerCase(Locale.ROOT);
       InetSocketAddress origin = request.getOrigin();
       int peerPort = request.getPort();
-      if (origin != null && peerPort > 0 && peerPort <= 65535) {
-        peerEndpoint = new InetSocketAddress(origin.getAddress(), peerPort);
-        InetSocketAddress peer = peerEndpoint;
-        announcedPeers.compute(infoHash, (ignored, existing) -> {
-          Map<InetSocketAddress, PeerHint> peers = existing == null ? new LinkedHashMap<>() : new LinkedHashMap<>(existing);
-          peers.put(peer, new PeerHint(peer, System.currentTimeMillis()));
-          while (peers.size() > 3) peers.remove(peers.keySet().iterator().next());
-          return peers;
-        });
+      List<InetSocketAddress> endpoints = announceEndpoints(origin, peerPort);
+      if (!endpoints.isEmpty()) {
+        peerEndpoint = endpoints.getFirst();
+        rememberAnnouncedPeers(infoHash, endpoints);
       }
     } else {
       return;
     }
     InetSocketAddress persistedPeer = peerEndpoint;
     InetSocketAddress persistedSource = sourceEndpoint;
+    seedRoutingTable(dht, sourceEndpoint);
     queryCounts.computeIfAbsent(query, ignored -> new LongAdder()).increment();
     if (!permits.tryAcquire()) return;
     tasks.submit(() -> {
       try {
-        acceptResource(infoHash, query);
+        boolean metadataNeeded = acceptResource(infoHash, query);
         if (query.equals("announce_peer")) {
+          if (metadataNeeded) startMetadataForAnnounce(infoHash);
           if (persistedPeer != null) {
             catalog.event("dht.peer_discovered", infoHash,
                 peerEventJson(infoHash, persistedPeer, persistedSource), "passive",
                 persistedPeer, persistedSource);
           }
-          startMetadataForAnnounce(infoHash);
         }
       } catch (Exception error) {
         monitor.metric("collector.failed", 1);
@@ -182,16 +207,15 @@ final class DhtCollector implements AutoCloseable {
     });
   }
 
-  private void acceptResource(String infoHash, String query) throws Exception {
+  private boolean acceptResource(String infoHash, String query) throws Exception {
     long nowMillis = System.currentTimeMillis();
     Instant now = Instant.ofEpochMilli(nowMillis);
     if (cache.contains(infoHash, nowMillis)) {
       cache.observe(infoHash, nowMillis);
       pendingTouches.put(infoHash, now);
-      if (query.equals("announce_peer")) catalog.queueMetadataJob(infoHash, now, 100, true);
-      return;
+      return query.equals("announce_peer") && catalog.queueMetadataJob(infoHash, now, 100, true);
     }
-    if (config.maxResources() > 0 && discovered.get() >= config.maxResources() && !catalog.exists(infoHash)) return;
+    if (config.maxResources() > 0 && discovered.get() >= config.maxResources() && !catalog.exists(infoHash)) return false;
     cache.observe(infoHash, nowMillis);
     boolean fresh;
     try {
@@ -207,7 +231,8 @@ final class DhtCollector implements AutoCloseable {
           "{\"event\":\"dht.resource_discovered\",\"info_hash\":\"" + infoHash
               + "\",\"query\":\"" + query + "\"}");
     }
-    catalog.queueMetadataJob(infoHash, now, query.equals("announce_peer") ? 100 : 10, query.equals("announce_peer"));
+    boolean queued = catalog.queueMetadataJob(infoHash, now, query.equals("announce_peer") ? 100 : 10, query.equals("announce_peer"));
+    return query.equals("announce_peer") && queued;
   }
 
   private void flushTouches() throws Exception {
@@ -218,68 +243,211 @@ final class DhtCollector implements AutoCloseable {
   }
 
   private void pollMetadataJobs() throws Exception {
-    int capacity = metadataPermits.availablePermits();
-    if (capacity == 0) return;
-    for (String infoHash : catalog.claimMetadataJobs(capacity, Instant.now())) {
-      if (runningMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) continue;
-      if (!metadataPermits.tryAcquire()) return;
-      tasks.submit(() -> {
+    int immediateReserve = Math.max(8, config.metadataConcurrent() / 4);
+    int fallbackReserve = Math.max(4, config.metadataConcurrent() / 4);
+    int liveCapacity = Math.max(0, metadataPermits.availablePermits() - immediateReserve - fallbackReserve);
+    if (liveCapacity > 0) launchMetadataJobs(liveCapacity, LIVE_METADATA_PRIORITY, liveMetadataTimeoutSeconds());
+    int fallbackCapacity = Math.min(fallbackReserve,
+        Math.max(0, metadataPermits.availablePermits() - immediateReserve));
+    if (fallbackCapacity > 0) launchMetadataJobs(fallbackCapacity, 0, LIVE_METADATA_PRIORITY, config.metadataTimeoutSeconds());
+  }
+
+  private void launchMetadataJobs(int capacity, int minimumPriority, int timeoutSeconds) throws Exception {
+    launchMetadataJobs(capacity, minimumPriority, Integer.MAX_VALUE, timeoutSeconds);
+  }
+
+  private void launchMetadataJobs(int capacity, int minimumPriority, int maximumPriority, int timeoutSeconds) throws Exception {
+    int reserved = 0;
+    while (reserved < capacity && metadataPermits.tryAcquire()) reserved++;
+    if (reserved == 0) return;
+    int remaining = reserved;
+    try {
+      Instant claimedAt = Instant.now();
+      List<String> claimed = catalog.claimMetadataJobs(reserved, claimedAt, minimumPriority, maximumPriority);
+      Map<String, List<InetSocketAddress>> persistedPeers;
+      try {
+        persistedPeers = catalog.recentPeerHints(claimed,
+            claimedAt.minusMillis(ANNOUNCE_PEER_TTL_MS), 3);
+      } catch (Exception error) {
+        persistedPeers = Map.of();
+        monitor.metric("collector.failed", 1);
+        System.err.println("recent peer recovery failed: " + error.getMessage());
+      }
+      final Map<String, List<InetSocketAddress>> recoveredPeers = persistedPeers;
+      for (String infoHash : claimed) {
+        remaining--;
+        if (runningMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) {
+          catalog.queueMetadataJob(infoHash, Instant.now().plusSeconds(5), minimumPriority, true);
+          metadataPermits.release();
+          continue;
+        }
         try {
-          Collection<InetSocketAddress> preferredPeers = currentAnnouncePeers(infoHash);
-          metadata.fetch(infoHash, preferredPeers).toCompletableFuture()
-              .get(config.metadataTimeoutSeconds() + 5L, TimeUnit.SECONDS)
-              .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
-                  () -> completeMetadataFailure(infoHash, "no metadata result"));
-        } catch (Exception error) {
-          completeMetadataFailure(infoHash, error.getMessage());
-        } finally {
+          tasks.submit(() -> {
+            try {
+              Collection<InetSocketAddress> preferredPeers = mergePeerHints(
+                  currentAnnouncePeers(infoHash), recoveredPeers.get(infoHash));
+              metadata.fetch(infoHash, preferredPeers, timeoutSeconds).toCompletableFuture()
+                  .get(timeoutSeconds + 5L, TimeUnit.SECONDS)
+                  .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
+                      () -> completeMetadataFailure(infoHash, "no metadata result"));
+            } catch (Exception error) {
+              completeMetadataFailure(infoHash, error.getMessage());
+            } finally {
+              runningMetadata.remove(infoHash);
+              metadataPermits.release();
+            }
+          });
+        } catch (RuntimeException error) {
           runningMetadata.remove(infoHash);
           metadataPermits.release();
+          throw error;
         }
-      });
+      }
+    } finally {
+      if (remaining > 0) metadataPermits.release(remaining);
     }
   }
 
+  /**
+   * Public bootstrap routers currently answer with empty node lists. Passive traffic already
+   * gives us live DHT endpoints, so probe a bounded number of those endpoints to seed mldht's
+   * routing table. addDHTNode performs the library's bogon/type checks and stops accepting nodes
+   * once the table is populated.
+   */
+  private void seedRoutingTable(DHT dht, InetSocketAddress source) {
+    if (source == null || source.getAddress() == null || source.getPort() < 1
+        || source.getPort() > 65535 || dht.getNode().getNumEntriesInRoutingTable() >= 30) return;
+    AtomicLong gate = incomingNodeProbeGates.computeIfAbsent(dht, ignored -> new AtomicLong());
+    long now = System.nanoTime();
+    while (true) {
+      long allowedAt = gate.get();
+      if (now < allowedAt) return;
+      if (gate.compareAndSet(allowedAt, now + INCOMING_NODE_PROBE_INTERVAL_NANOS)) break;
+    }
+    dht.addDHTNode(source.getAddress().getHostAddress(), source.getPort());
+  }
+
   private void startMetadataForAnnounce(String infoHash) {
-    if (runningMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) return;
-    if (!metadataPermits.tryAcquire()) {
-      runningMetadata.remove(infoHash);
+    if (!metadataPermits.tryAcquire()) return;
+    if (runningDirectMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) {
+      metadataPermits.release();
+      return;
+    }
+    PeerSnapshot peers = currentAnnouncePeerSnapshot(infoHash);
+    try {
+      if (!catalog.claimImmediateMetadataJob(infoHash, Instant.now())) {
+        runningDirectMetadata.remove(infoHash);
+        metadataPermits.release();
+        return;
+      }
+    } catch (Exception error) {
+      runningDirectMetadata.remove(infoHash);
+      metadataPermits.release();
+      monitor.metric("collector.failed", 1);
+      System.err.println("metadata announce claim failed: " + error.getMessage());
       return;
     }
     tasks.submit(() -> {
       try {
-        metadata.fetch(infoHash, currentAnnouncePeers(infoHash)).toCompletableFuture()
-            .get(config.metadataTimeoutSeconds() + 5L, TimeUnit.SECONDS)
-            .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
-                () -> completeMetadataFailure(infoHash, "no metadata result"));
+        int timeoutSeconds = liveDirectTimeoutSeconds();
+        metadata.fetchDirect(infoHash, peers.addresses(), timeoutSeconds).toCompletableFuture()
+            .get(timeoutSeconds + 5L, TimeUnit.SECONDS)
+            .ifPresentOrElse(manifest -> completeDirectMetadataSuccess(infoHash, manifest),
+                () -> completeDirectMetadataMiss(infoHash, "no direct metadata result"));
       } catch (Exception error) {
-        completeMetadataFailure(infoHash, error.getMessage());
+        completeDirectMetadataMiss(infoHash, error.getMessage());
       } finally {
-        runningMetadata.remove(infoHash);
+        runningDirectMetadata.remove(infoHash);
         metadataPermits.release();
+        if (latestAnnouncePeerSequence(infoHash) > peers.sequence()) startMetadataForAnnounce(infoHash);
       }
     });
   }
 
+  private int liveMetadataTimeoutSeconds() {
+    return Math.min(LIVE_METADATA_TIMEOUT_SECONDS, config.metadataTimeoutSeconds());
+  }
+
+  private int liveDirectTimeoutSeconds() {
+    return Math.min(LIVE_DIRECT_TIMEOUT_SECONDS, config.metadataTimeoutSeconds());
+  }
+
   private Collection<InetSocketAddress> currentAnnouncePeers(String infoHash) {
+    return currentAnnouncePeerSnapshot(infoHash).addresses();
+  }
+
+  static List<InetSocketAddress> mergePeerHints(Collection<InetSocketAddress> live,
+                                                 Collection<InetSocketAddress> persisted) {
+    LinkedHashSet<InetSocketAddress> merged = new LinkedHashSet<>();
+    if (live != null) merged.addAll(live);
+    if (persisted != null) merged.addAll(persisted);
+    return merged.stream().filter(peer -> peer != null && peer.getAddress() != null
+        && peer.getPort() > 0 && peer.getPort() <= 65535)
+        .limit(DirectMetadataFetcher.MAX_PEERS_PER_FETCH).toList();
+  }
+
+  private PeerSnapshot currentAnnouncePeerSnapshot(String infoHash) {
     long cutoff = System.currentTimeMillis() - ANNOUNCE_PEER_TTL_MS;
     Map<InetSocketAddress, PeerHint> hints = announcedPeers.get(infoHash);
-    if (hints == null) return List.of();
-    return hints.values().stream().filter(hint -> hint.observedAt() >= cutoff).map(PeerHint::address).toList();
+    if (hints == null) return new PeerSnapshot(List.of(), 0);
+    List<PeerHint> active = hints.values().stream()
+        .filter(hint -> hint.observedAt() >= cutoff)
+        .sorted(java.util.Comparator.comparingLong(PeerHint::observedAt).reversed())
+        .toList();
+    long sequence = active.stream().mapToLong(PeerHint::sequence).max().orElse(0);
+    return new PeerSnapshot(active.stream().map(PeerHint::address).toList(), sequence);
+  }
+
+  private long latestAnnouncePeerSequence(String infoHash) {
+    Map<InetSocketAddress, PeerHint> hints = announcedPeers.get(infoHash);
+    return hints == null ? 0 : hints.values().stream().mapToLong(PeerHint::sequence).max().orElse(0);
+  }
+
+  private void rememberAnnouncedPeers(String infoHash, List<InetSocketAddress> endpoints) {
+    long now = System.currentTimeMillis();
+    announcedPeers.compute(infoHash, (ignored, existing) -> {
+      Map<InetSocketAddress, PeerHint> peers = existing == null
+          ? new LinkedHashMap<>() : new LinkedHashMap<>(existing);
+      for (InetSocketAddress endpoint : endpoints) {
+        peers.remove(endpoint);
+        peers.put(endpoint, new PeerHint(endpoint, now, peerSequence.incrementAndGet()));
+      }
+      while (peers.size() > MAX_ANNOUNCE_ENDPOINTS) peers.remove(peers.keySet().iterator().next());
+      return peers;
+    });
+  }
+
+  static List<InetSocketAddress> announceEndpoints(InetSocketAddress origin, int advertisedPort) {
+    if (origin == null || origin.getAddress() == null || advertisedPort < 1 || advertisedPort > 65535) {
+      return List.of();
+    }
+    InetSocketAddress advertised = new InetSocketAddress(origin.getAddress(), advertisedPort);
+    if (origin.getPort() < 1 || origin.getPort() > 65535 || origin.getPort() == advertisedPort) {
+      return List.of(advertised);
+    }
+    // mldht does not expose BEP-5 implied_port, so the UDP source is a bounded fallback.
+    return List.of(advertised, new InetSocketAddress(origin.getAddress(), origin.getPort()));
   }
 
   private void completeMetadataSuccess(String infoHash, Manifest manifest) {
     try {
-      catalog.upsertManifest(manifest);
+      Catalog.ManifestWrite write = catalog.upsertManifest(manifest);
       monitor.metric("metadata.fetch_completed", 1);
       catalog.event("metadata.fetch_completed", infoHash,
           "{\"event\":\"metadata.fetch_completed\",\"info_hash\":\"" + infoHash
-              + "\",\"name\":\"" + jsonEscape(manifest.name()) + "\"}", "passive");
+              + "\",\"name\":\"" + jsonEscape(manifest.name()) + "\",\"new_content\":"
+              + write.inserted() + "}", "passive");
+      if (write.inserted()) monitor.metric("content.indexed", 1);
       catalog.completeMetadataJob(infoHash, true, Instant.now());
     } catch (Exception error) {
       monitor.metric("collector.failed", 1);
       System.err.println("metadata persistence failed: " + error.getMessage());
     }
+  }
+
+  private void completeDirectMetadataSuccess(String infoHash, Manifest manifest) {
+    monitor.metric("metadata.direct_completed", 1);
+    completeMetadataSuccess(infoHash, manifest);
   }
 
   private void completeMetadataFailure(String infoHash, String message) {
@@ -292,6 +460,20 @@ final class DhtCollector implements AutoCloseable {
     } catch (Exception error) {
       monitor.metric("collector.failed", 1);
       System.err.println("metadata failure persistence failed: " + error.getMessage());
+    }
+  }
+
+  private void completeDirectMetadataMiss(String infoHash, String message) {
+    try {
+      catalog.queueMetadataJob(infoHash, Instant.now().plusSeconds(DIRECT_FALLBACK_DELAY_SECONDS),
+          DIRECT_FALLBACK_PRIORITY, true);
+      monitor.metric("metadata.direct_miss", 1);
+      catalog.event("metadata.direct_miss", infoHash,
+          "{\"event\":\"metadata.direct_miss\",\"info_hash\":\"" + infoHash
+              + "\",\"message\":\"" + jsonEscape(message == null ? "unknown" : message) + "\"}", "passive");
+    } catch (Exception error) {
+      monitor.metric("collector.failed", 1);
+      System.err.println("direct metadata retry persistence failed: " + error.getMessage());
     }
   }
 
@@ -327,8 +509,8 @@ final class DhtCollector implements AutoCloseable {
   @Override public void close() {
     if (stopping) return;
     stopping = true;
-    nodes.forEach(DHT::stop);
     metadata.close();
+    nodes.forEach(DHT::stop);
     scheduler.shutdownNow();
     tasks.close();
     try {

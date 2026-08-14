@@ -10,11 +10,18 @@ import java.util.Map;
 final class Bencode {
   private Bencode() {}
 
+  record Decoded(Object value, int consumed) {}
+
   static Object decode(byte[] input) {
     Parser parser = new Parser(input);
     Object value = parser.value();
     if (!parser.done()) throw new IllegalArgumentException("trailing bencode data");
     return value;
+  }
+
+  static Decoded decodePrefix(byte[] input) {
+    Parser parser = new Parser(input);
+    return new Decoded(parser.value(), parser.index);
   }
 
   static byte[] encode(Object value) {

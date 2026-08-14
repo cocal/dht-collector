@@ -10,11 +10,21 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import lbms.plugins.mldht.kad.DHT;
 import lbms.plugins.mldht.kad.Key;
+import lbms.plugins.mldht.kad.RPCServer;
+import lbms.plugins.mldht.kad.tasks.PeerLookupTask;
 import the8472.mldht.FetchTaskPeerHints;
 import the8472.mldht.TorrentFetcher;
 
@@ -26,43 +36,280 @@ record ManifestFile(String path, long size) {}
 
 final class MetadataFetcher implements AutoCloseable {
   static final int MAX_METADATA_BYTES = 2 * 1024 * 1024;
+  private static final int DIRECT_ATTEMPT_TIMEOUT_SECONDS = 10;
+  private static final int DHT_DIRECT_TIMEOUT_SECONDS = 10;
+  private static final int DHT_PEER_COLLECTION_DELAY_MILLIS = 500;
   private final TorrentFetcher fetcher;
+  private final List<DHT> dhtNodes;
+  private final DirectMetadataFetcher direct = new DirectMetadataFetcher();
   private final int timeoutSeconds;
+  private final BiConsumer<String, Long> metric;
   private final ConcurrentHashMap.KeySetView<TorrentFetcher.FetchTask, Boolean> activeTasks = ConcurrentHashMap.newKeySet();
+  private final ConcurrentHashMap.KeySetView<PeerLookupTask, Boolean> activeLookups = ConcurrentHashMap.newKeySet();
+  private final AtomicLong lookupCursor = new AtomicLong();
 
   MetadataFetcher(List<lbms.plugins.mldht.kad.DHT> nodes, int maxConcurrent, int timeoutSeconds) {
-    fetcher = new TorrentFetcher(nodes);
+    this(nodes, maxConcurrent, timeoutSeconds, (ignored, value) -> { });
+  }
+
+  MetadataFetcher(List<lbms.plugins.mldht.kad.DHT> nodes, int maxConcurrent, int timeoutSeconds,
+                  BiConsumer<String, Long> metric) {
+    dhtNodes = List.copyOf(nodes);
+    // TorrentFetcher only starts when its RPC server has no queued tasks. Node zero is kept
+    // exclusively for it; independent peer lookups rotate over the remaining identities.
+    fetcher = new TorrentFetcher(dhtNodes.stream().limit(1).toList());
     fetcher.setMaxOpen(Math.max(1, maxConcurrent));
     fetcher.setMaxSockets(Math.max(8, maxConcurrent * 4));
     this.timeoutSeconds = timeoutSeconds;
+    this.metric = metric == null ? (ignored, value) -> { } : metric;
   }
 
   CompletionStage<Optional<Manifest>> fetch(String infoHash) {
-    return fetch(infoHash, (Collection<InetSocketAddress>) null);
+    return fetch(infoHash, (Collection<InetSocketAddress>) null, timeoutSeconds);
   }
 
   CompletionStage<Optional<Manifest>> fetch(String infoHash, InetSocketAddress preferredPeer) {
-    return fetch(infoHash, preferredPeer == null ? List.of() : List.of(preferredPeer));
+    return fetch(infoHash, preferredPeer == null ? List.of() : List.of(preferredPeer), timeoutSeconds);
   }
 
   CompletionStage<Optional<Manifest>> fetch(String infoHash, Collection<InetSocketAddress> preferredPeers) {
-    Key key = new Key(infoHash);
-    var task = preferredPeers == null || preferredPeers.isEmpty() ? fetcher.fetch(key)
-        : fetcher.fetch(key, fetchTask -> preferredPeers.forEach(peer -> FetchTaskPeerHints.add(fetchTask, peer)));
-    activeTasks.add(task);
+    return fetch(infoHash, preferredPeers, timeoutSeconds);
+  }
+
+  CompletionStage<Optional<Manifest>> fetch(String infoHash, Collection<InetSocketAddress> preferredPeers,
+                                             int taskTimeoutSeconds) {
+    if (taskTimeoutSeconds < 1) throw new IllegalArgumentException("metadata timeout must be positive");
+    if (preferredPeers != null && !preferredPeers.isEmpty()) {
+      return fetchDirectThenDht(infoHash, preferredPeers, taskTimeoutSeconds);
+    }
+    return fetchWithDht(infoHash, List.of(), taskTimeoutSeconds);
+  }
+
+  CompletionStage<Optional<Manifest>> fetchDirect(String infoHash,
+                                                   Collection<InetSocketAddress> preferredPeers,
+                                                   int taskTimeoutSeconds) {
+    if (taskTimeoutSeconds < 1) throw new IllegalArgumentException("metadata timeout must be positive");
+    if (preferredPeers == null || preferredPeers.isEmpty()) {
+      return CompletableFuture.completedFuture(Optional.empty());
+    }
     CompletableFuture<Optional<Manifest>> result = new CompletableFuture<>();
-    task.awaitCompletion().whenComplete((done, error) -> {
-      activeTasks.remove(task);
-      if (error != null) result.completeExceptionally(error);
-      else {
-        try { result.complete(done.getResult().map(buffer -> parse(buffer, infoHash))); }
-        catch (Exception parseError) { result.completeExceptionally(parseError); }
+    direct.fetch(infoHash, preferredPeers, taskTimeoutSeconds).whenComplete((raw, error) -> {
+      if (error != null) {
+        result.completeExceptionally(error);
+        return;
+      }
+      try {
+        result.complete(raw.map(bytes -> parse(ByteBuffer.wrap(bytes), infoHash)));
+      } catch (Exception parseError) {
+        result.completeExceptionally(parseError);
       }
     });
-    CompletableFuture.delayedExecutor(timeoutSeconds, TimeUnit.SECONDS).execute(() -> {
-      if (!result.isDone()) task.stop();
+    return result;
+  }
+
+  private CompletionStage<Optional<Manifest>> fetchDirectThenDht(String infoHash,
+                                                                  Collection<InetSocketAddress> preferredPeers,
+                                                                  int taskTimeoutSeconds) {
+    CompletableFuture<Optional<Manifest>> result = new CompletableFuture<>();
+    long started = System.nanoTime();
+    int directTimeout = Math.min(DIRECT_ATTEMPT_TIMEOUT_SECONDS, Math.max(1, taskTimeoutSeconds - 1));
+    direct.fetch(infoHash, preferredPeers, directTimeout).whenComplete((raw, directError) -> {
+      if (raw != null && raw.isPresent()) {
+        try {
+          result.complete(Optional.of(parse(java.nio.ByteBuffer.wrap(raw.get()), infoHash)));
+          return;
+        } catch (Exception ignored) {
+          // A malformed direct response should not prevent a DHT fallback.
+        }
+      }
+      long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+      long remainingMillis = Math.max(1_000L, taskTimeoutSeconds * 1_000L - elapsedMillis);
+      int remainingSeconds = (int) Math.min(Integer.MAX_VALUE, (remainingMillis + 999L) / 1_000L);
+      fetchWithDht(infoHash, preferredPeers, remainingSeconds).whenComplete((fallback, error) -> {
+        if (error != null) result.completeExceptionally(error);
+        else result.complete(fallback);
+      });
     });
     return result;
+  }
+
+  private CompletionStage<Optional<Manifest>> fetchWithDht(String infoHash,
+                                                            Collection<InetSocketAddress> preferredPeers,
+                                                            int taskTimeoutSeconds) {
+    Key key = new Key(infoHash);
+    metric.accept("metadata.dht_fetch_started", 1L);
+    CompletableFuture<Optional<Manifest>> result = new CompletableFuture<>();
+    Set<InetSocketAddress> dhtPeers = ConcurrentHashMap.newKeySet();
+    List<InetSocketAddress> preferredPeerList = preferredPeers == null ? List.of()
+        : preferredPeers.stream().filter(java.util.Objects::nonNull).distinct().toList();
+    Set<InetSocketAddress> preferredPeerSet = Set.copyOf(preferredPeerList);
+    dhtPeers.addAll(preferredPeerList);
+    Set<InetSocketAddress> newDhtPeers = ConcurrentHashMap.newKeySet();
+    ConcurrentLinkedQueue<InetSocketAddress> dhtPeerOrder = new ConcurrentLinkedQueue<>();
+    AtomicBoolean directStarted = new AtomicBoolean();
+    AtomicBoolean directDone = new AtomicBoolean();
+    AtomicBoolean directLaunchScheduled = new AtomicBoolean();
+    AtomicBoolean dhtDone = new AtomicBoolean();
+    AtomicBoolean lookupDone = new AtomicBoolean();
+    AtomicReference<Optional<Manifest>> dhtResult = new AtomicReference<>(Optional.empty());
+    AtomicReference<Throwable> dhtError = new AtomicReference<>();
+    AtomicReference<TorrentFetcher.FetchTask> taskRef = new AtomicReference<>();
+    AtomicReference<PeerLookupTask> lookupRef = new AtomicReference<>();
+    long startNanos = System.nanoTime();
+    Runnable completeDht = () -> {
+      if (result.isDone()) return;
+      Throwable error = dhtError.get();
+      if (error != null) result.completeExceptionally(error);
+      else result.complete(dhtResult.get());
+    };
+    Runnable launchDirect = () -> {
+      if (dhtPeers.isEmpty() || !directStarted.compareAndSet(false, true)) return;
+      metric.accept("metadata.dht_peers", (long) dhtPeers.size());
+      long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime()
+          - startNanos);
+      long remainingMillis = taskTimeoutSeconds * 1_000L - elapsedMillis;
+      if (remainingMillis < 1_000L) {
+        directDone.set(true);
+        if (dhtDone.get() && lookupDone.get()) completeDht.run();
+        return;
+      }
+      int directTimeout = (int) Math.min(DHT_DIRECT_TIMEOUT_SECONDS,
+          Math.max(1L, (remainingMillis + 999L) / 1_000L));
+      metric.accept("metadata.dht_direct_started", 1L);
+      List<InetSocketAddress> candidates = new ArrayList<>(preferredPeerList);
+      dhtPeerOrder.forEach(peer -> { if (!candidates.contains(peer)) candidates.add(peer); });
+      dhtPeers.forEach(peer -> { if (!candidates.contains(peer)) candidates.add(peer); });
+      direct.fetch(infoHash, candidates, directTimeout).whenComplete((raw, error) -> {
+        Optional<Manifest> manifest = Optional.empty();
+        if (error == null && raw != null && raw.isPresent()) {
+          try { manifest = Optional.of(parse(ByteBuffer.wrap(raw.get()), infoHash)); }
+          catch (Exception ignored) { }
+        }
+        directDone.set(true);
+        if (manifest.isPresent()) {
+          metric.accept("metadata.dht_direct_completed", 1L);
+          result.complete(manifest);
+          TorrentFetcher.FetchTask task = taskRef.get();
+          if (task != null) task.stop();
+          PeerLookupTask lookup = lookupRef.get();
+          if (lookup != null) lookup.kill();
+        } else if (dhtDone.get() && lookupDone.get()) {
+          metric.accept("metadata.dht_direct_miss", 1L);
+          completeDht.run();
+        } else {
+          metric.accept("metadata.dht_direct_miss", 1L);
+        }
+      });
+    };
+    Runnable scheduleDirect = () -> {
+      if (directStarted.get() || result.isDone()
+          || !directLaunchScheduled.compareAndSet(false, true)) return;
+      CompletableFuture.delayedExecutor(DHT_PEER_COLLECTION_DELAY_MILLIS,
+          TimeUnit.MILLISECONDS).execute(() -> {
+            directLaunchScheduled.set(false);
+            launchDirect.run();
+          });
+    };
+    var task = preferredPeerSet.isEmpty() ? fetcher.fetch(key)
+        : fetcher.fetch(key, fetchTask -> preferredPeerSet.forEach(peer -> FetchTaskPeerHints.add(fetchTask, peer)));
+    taskRef.set(task);
+    activeTasks.add(task);
+    PeerLookupTask lookup = startPeerLookup(infoHash, peer -> {
+      if (peer == null || !dhtPeers.add(peer)) return;
+      if (preferredPeerSet.contains(peer)) return;
+      if (!newDhtPeers.add(peer)) return;
+      dhtPeerOrder.add(peer);
+      int peerCount = newDhtPeers.size();
+      if (peerCount >= DirectMetadataFetcher.MAX_PEERS_PER_FETCH) {
+        PeerLookupTask activeLookup = lookupRef.get();
+        if (activeLookup != null) activeLookup.kill();
+        launchDirect.run();
+      } else if (preferredPeerSet.isEmpty() ? peerCount >= 3 : peerCount >= 1) {
+        scheduleDirect.run();
+      }
+    }, () -> {
+      lookupDone.set(true);
+      if (!newDhtPeers.isEmpty() || preferredPeerSet.isEmpty() && !dhtPeers.isEmpty()) {
+        launchDirect.run();
+      }
+      if (dhtDone.get() && (!directStarted.get() || directDone.get())) completeDht.run();
+    });
+    lookupRef.set(lookup);
+    if (lookup == null) lookupDone.set(true);
+    task.awaitCompletion().whenComplete((done, error) -> {
+      activeTasks.remove(task);
+      if (error != null) {
+        dhtError.set(error);
+      } else {
+        try {
+          dhtResult.set(done.getResult().map(buffer -> parse(buffer, infoHash)));
+          if (dhtResult.get().isPresent()) metric.accept("metadata.dht_library_completed", 1L);
+        }
+        catch (Exception parseError) { dhtError.set(parseError); }
+      }
+      dhtDone.set(true);
+      if (dhtResult.get().isPresent()) {
+        result.complete(dhtResult.get());
+        if (lookup != null) lookup.kill();
+      } else if (lookupDone.get() && (!directStarted.get() || directDone.get())) {
+        completeDht.run();
+      }
+    });
+    CompletableFuture.delayedExecutor(taskTimeoutSeconds, TimeUnit.SECONDS).execute(() -> {
+      if (result.isDone()) return;
+      dhtDone.set(true);
+      lookupDone.set(true);
+      task.stop();
+      PeerLookupTask activeLookup = lookupRef.get();
+      if (activeLookup != null) activeLookup.kill();
+      if (!directStarted.get() || directDone.get()) completeDht.run();
+    });
+    return result;
+  }
+
+  private PeerLookupTask startPeerLookup(String infoHash, Consumer<InetSocketAddress> onPeer,
+                                         Runnable onComplete) {
+    for (int nodeIndex : lookupNodeOrder(dhtNodes.size(), lookupCursor.getAndIncrement())) {
+      DHT dht = dhtNodes.get(nodeIndex);
+      RPCServer server = dht.getServerManager().getRandomActiveServer(true);
+      if (server == null) continue;
+      PeerLookupTask lookup = new PeerLookupTask(server, dht.getNode(), new Key(infoHash));
+      lookup.setNoAnnounce(true);
+      lookup.setFastTerminate(false);
+      lookup.setResultHandler((source, item) -> {
+        if (item != null) onPeer.accept(item.toSocketAddress());
+      });
+      activeLookups.add(lookup);
+      lookup.addListener(ignored -> {
+        activeLookups.remove(lookup);
+        onComplete.run();
+      });
+      metric.accept("metadata.dht_lookup_configured", 1L);
+      dht.getTaskManager().addTask(lookup);
+      return lookup;
+    }
+    metric.accept("metadata.dht_lookup_unavailable", 1L);
+    return null;
+  }
+
+  static List<Integer> lookupNodeOrder(int nodeCount, long cursor) {
+    if (nodeCount < 1) return List.of();
+    int firstLookupNode = nodeCount > 1 ? 1 : 0;
+    int available = nodeCount - firstLookupNode;
+    int start = (int) Math.floorMod(cursor, (long) available);
+    List<Integer> order = new ArrayList<>(available);
+    for (int offset = 0; offset < available; offset++) {
+      order.add(firstLookupNode + (start + offset) % available);
+    }
+    return List.copyOf(order);
+  }
+
+  long queuedDhtTasks() {
+    return dhtNodes.stream().mapToLong(dht -> dht.getTaskManager().getNumQueuedTasks()).sum();
+  }
+
+  long activeDhtTasks() {
+    return dhtNodes.stream().mapToLong(dht -> dht.getTaskManager().getActiveTasks().length).sum();
   }
 
   static Manifest parse(ByteBuffer input, String expectedHash) {
@@ -148,5 +395,9 @@ final class MetadataFetcher implements AutoCloseable {
     return out.toString();
   }
 
-  @Override public void close() { activeTasks.forEach(TorrentFetcher.FetchTask::stop); }
+  @Override public void close() {
+    direct.close();
+    List.copyOf(activeTasks).forEach(TorrentFetcher.FetchTask::stop);
+    List.copyOf(activeLookups).forEach(PeerLookupTask::kill);
+  }
 }

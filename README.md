@@ -160,6 +160,7 @@ can be sent directly to the event log described in
 - `metadata.fetch_started`
 - `metadata.fetch_completed`
 - `metadata.fetch_failed`
+- `content.indexed`
 - `collector.snapshot`
 - `collector.failed`
 
@@ -172,7 +173,8 @@ belongs in the event schema before metadata indexing is enabled.
 
 The dashboard trend endpoint is included in `GET /api/dashboard`. It returns
 five one-minute buckets for unique resource discoveries, incoming DHT queries,
-actual operation failures, and protocol warning occurrences. A warning such as
+actual operation failures, protocol warning occurrences, and newly indexed
+contents. A warning such as
 `Missing delimiter ":"` is a malformed UDP bencode packet reported by the DHT
 decoder; it is aggregated separately and does not mean the collector failed to
 join the network.

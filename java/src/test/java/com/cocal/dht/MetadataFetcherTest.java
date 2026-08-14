@@ -46,6 +46,14 @@ class MetadataFetcherTest {
     assertEquals(40, manifest.infoHash().length());
   }
 
+  @Test
+  void reservesFirstDhtNodeAndRotatesIndependentLookups() {
+    assertEquals(List.of(1, 2, 3), MetadataFetcher.lookupNodeOrder(4, 0));
+    assertEquals(List.of(3, 1, 2), MetadataFetcher.lookupNodeOrder(4, 2));
+    assertEquals(List.of(0), MetadataFetcher.lookupNodeOrder(1, 10));
+    assertEquals(List.of(), MetadataFetcher.lookupNodeOrder(0, 0));
+  }
+
   private static String hex(byte[] bytes) {
     var output = new StringBuilder();
     for (byte value : bytes) output.append(String.format(Locale.ROOT, "%02x", value & 0xff));

@@ -53,13 +53,14 @@
             <span class="count-chip" id="trend-window">近 5 分钟 · 每分钟</span>
           </div>
           <div class="trend-chart-wrap">
-            <canvas id="trend-chart" role="img" aria-label="近五分钟资源发现、DHT 查询和失败趋势图"></canvas>
+            <canvas id="trend-chart" role="img" aria-label="近五分钟资源发现、DHT 查询、失败和新增索引趋势图"></canvas>
             <div class="empty-state trend-empty" id="trend-empty" hidden>等待最近 5 分钟的数据</div>
           </div>
           <div class="trend-legend" aria-label="系统趋势图图例">
             <span><i class="legend-links"></i>资源发现</span>
             <span><i class="legend-queries"></i>查询数</span>
             <span><i class="legend-failures"></i>失败数</span>
+            <span><i class="legend-indexed"></i>新增索引</span>
           </div>
           <p class="trend-note" id="trend-note">协议告警 0 次</p>
         </section>
@@ -81,6 +82,26 @@
             <caption>近五分钟每分钟新发现 Infohash 数量</caption>
             <thead><tr><th>时间</th><th>数量</th></tr></thead>
             <tbody id="resource-trend-table"></tbody>
+          </table>
+        </section>
+
+        <section class="trend-panel indexed-trend-panel" aria-labelledby="indexed-trend-title">
+          <div class="panel-heading">
+            <div><p class="eyebrow">INDEX THROUGHPUT</p><h2 id="indexed-trend-title">新增索引趋势</h2></div>
+            <span class="count-chip" id="indexed-trend-total">近 5 分钟 · 0</span>
+          </div>
+          <div class="trend-chart-wrap">
+            <canvas id="indexed-trend-chart" role="img" aria-label="近五分钟每分钟新增索引内容趋势图"></canvas>
+            <div class="empty-state trend-empty" id="indexed-trend-empty" hidden>等待新增索引数据</div>
+          </div>
+          <div class="trend-legend" aria-label="新增索引趋势图图例">
+            <span><i class="legend-indexed legend-line"></i>每分钟新增内容</span>
+          </div>
+          <p class="trend-note" id="indexed-trend-note">峰值 0 个/分钟</p>
+          <table class="sr-only">
+            <caption>近五分钟每分钟新增索引内容数量</caption>
+            <thead><tr><th>时间</th><th>数量</th></tr></thead>
+            <tbody id="indexed-trend-table"></tbody>
           </table>
         </section>
       </div>

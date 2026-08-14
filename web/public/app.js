@@ -74,10 +74,11 @@ function renderTrend(trend) {
   const lime = styles.getPropertyValue('--lime').trim() || '#b8ef65'
   const teal = styles.getPropertyValue('--teal').trim() || '#65d5ca'
   const coral = styles.getPropertyValue('--coral').trim() || '#f08d7e'
+  const amber = styles.getPropertyValue('--amber').trim() || '#f4c46a'
   const padding = { top: 14, right: 16, bottom: 31, left: 38 }
   const plotWidth = width - padding.left - padding.right
   const plotHeight = height - padding.top - padding.bottom
-  const maxValue = Math.max(1, ...buckets.flatMap((bucket) => [bucket.links, bucket.queries, bucket.failures]))
+  const maxValue = Math.max(1, ...buckets.flatMap((bucket) => [bucket.links, bucket.queries, bucket.failures, bucket.indexed]))
   const y = (value) => padding.top + plotHeight - ((value / maxValue) * plotHeight)
   const x = (index) => buckets.length === 1
     ? padding.left + (plotWidth / 2)
@@ -126,12 +127,14 @@ function renderTrend(trend) {
   drawSeries('links', lime)
   drawSeries('queries', teal)
   drawSeries('failures', coral)
+  drawSeries('indexed', amber)
   const warnings = buckets.reduce((sum, bucket) => sum + Number(bucket.warnings || 0), 0)
   const links = buckets.reduce((sum, bucket) => sum + Number(bucket.links || 0), 0)
   const queries = buckets.reduce((sum, bucket) => sum + Number(bucket.queries || 0), 0)
   const failures = buckets.reduce((sum, bucket) => sum + Number(bucket.failures || 0), 0)
-  $('#trend-note').textContent = `协议告警 ${formatNumber(warnings)} 次 · 资源发现 ${formatNumber(links)} · 查询 ${formatNumber(queries)} · 失败 ${formatNumber(failures)}`
-  canvas.setAttribute('aria-label', `近五分钟趋势：资源发现 ${formatNumber(links)}，查询 ${formatNumber(queries)}，失败 ${formatNumber(failures)}`)
+  const indexed = buckets.reduce((sum, bucket) => sum + Number(bucket.indexed || 0), 0)
+  $('#trend-note').textContent = `协议告警 ${formatNumber(warnings)} 次 · 资源发现 ${formatNumber(links)} · 查询 ${formatNumber(queries)} · 失败 ${formatNumber(failures)} · 新增索引 ${formatNumber(indexed)}`
+  canvas.setAttribute('aria-label', `近五分钟趋势：资源发现 ${formatNumber(links)}，查询 ${formatNumber(queries)}，失败 ${formatNumber(failures)}，新增索引 ${formatNumber(indexed)}`)
 }
 
 function renderResourceTrend(trend) {
@@ -232,6 +235,84 @@ function renderResourceTrend(trend) {
   canvas.setAttribute('aria-label', `近五分钟资源嗅探趋势：共发现 ${formatNumber(total)} 个 Infohash，峰值 ${formatNumber(peak)} 个每分钟`)
 }
 
+function renderIndexedTrend(trend) {
+  const canvas = $('#indexed-trend-chart')
+  const empty = $('#indexed-trend-empty')
+  const buckets = Array.isArray(trend?.buckets) ? trend.buckets : []
+  if (!buckets.length) {
+    empty.hidden = false
+    $('#indexed-trend-total').textContent = '近 5 分钟 · 0'
+    $('#indexed-trend-note').textContent = '峰值 0 个/分钟'
+    $('#indexed-trend-table').innerHTML = ''
+    return
+  }
+  empty.hidden = true
+  const rect = canvas.getBoundingClientRect()
+  const width = Math.max(280, Math.round(rect.width || canvas.parentElement.clientWidth || 280))
+  const height = Math.max(180, Math.round(rect.height || 240))
+  const ratio = Math.min(window.devicePixelRatio || 1, 2)
+  canvas.width = width * ratio
+  canvas.height = height * ratio
+  const context = canvas.getContext('2d')
+  context.setTransform(ratio, 0, 0, ratio, 0, 0)
+  context.clearRect(0, 0, width, height)
+
+  const styles = getComputedStyle(document.documentElement)
+  const border = styles.getPropertyValue('--border').trim() || '#39423a'
+  const muted = styles.getPropertyValue('--muted').trim() || '#9da99e'
+  const amber = styles.getPropertyValue('--amber').trim() || '#f4c46a'
+  const padding = { top: 14, right: 16, bottom: 31, left: 38 }
+  const plotWidth = width - padding.left - padding.right
+  const plotHeight = height - padding.top - padding.bottom
+  const values = buckets.map((bucket) => Number(bucket.indexed || 0))
+  const maxValue = Math.max(1, ...values)
+  const y = (value) => padding.top + plotHeight - ((value / maxValue) * plotHeight)
+  const x = (index) => buckets.length === 1
+    ? padding.left + (plotWidth / 2)
+    : padding.left + ((index / (buckets.length - 1)) * plotWidth)
+
+  context.font = '11px "Fira Code", monospace'
+  context.lineWidth = 1
+  context.strokeStyle = border
+  context.fillStyle = muted
+  context.textAlign = 'right'
+  for (let step = 0; step <= 3; step++) {
+    const value = Math.round((maxValue * step) / 3)
+    const lineY = y(value)
+    context.beginPath()
+    context.moveTo(padding.left, lineY)
+    context.lineTo(width - padding.right, lineY)
+    context.stroke()
+    context.fillText(formatNumber(value), padding.left - 8, lineY + 4)
+  }
+
+  const timeFormatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  context.textAlign = 'center'
+  buckets.forEach((bucket, index) => context.fillText(timeFormatter.format(new Date(bucket.at)), x(index), height - 10))
+  context.beginPath()
+  values.forEach((value, index) => index === 0 ? context.moveTo(x(index), y(value)) : context.lineTo(x(index), y(value)))
+  context.strokeStyle = amber
+  context.lineWidth = 2.5
+  context.lineJoin = 'round'
+  context.lineCap = 'round'
+  context.stroke()
+  values.forEach((value, index) => {
+    context.beginPath()
+    context.arc(x(index), y(value), 4, 0, Math.PI * 2)
+    context.fillStyle = amber
+    context.fill()
+    context.font = '600 10px "Fira Code", monospace'
+    context.fillText(formatNumber(value), x(index), Math.max(12, y(value) - 9))
+  })
+
+  const total = values.reduce((sum, value) => sum + value, 0)
+  const peak = Math.max(0, ...values)
+  $('#indexed-trend-total').textContent = `近 5 分钟 · ${formatNumber(total)}`
+  $('#indexed-trend-note').textContent = `峰值 ${formatNumber(peak)} 个/分钟 · 数据来自 content.indexed`
+  $('#indexed-trend-table').innerHTML = buckets.map((bucket, index) => `<tr><td>${escapeHtml(timeFormatter.format(new Date(bucket.at)))}</td><td>${formatNumber(values[index])}</td></tr>`).join('')
+  canvas.setAttribute('aria-label', `近五分钟新增索引趋势：共 ${formatNumber(total)} 个内容，峰值 ${formatNumber(peak)} 个每分钟`)
+}
+
 function renderEvents(probes) {
   const rows = state.filter === 'all' ? probes : probes.filter((probe) => probe.event_type === state.filter)
   $('#event-count').textContent = `${formatNumber(rows.length)} 条`
@@ -299,6 +380,7 @@ async function loadDashboard() {
     renderSummary(state.data.summary)
     renderTrend(state.data.trend)
     renderResourceTrend(state.data.trend)
+    renderIndexedTrend(state.data.trend)
     renderEvents(state.data.probes)
     renderContent(state.data.content)
     $('#connection-state').innerHTML = '<i></i> 已连接'
@@ -418,6 +500,7 @@ window.addEventListener('resize', () => {
   resizeTimer = setTimeout(() => {
     renderTrend(state.data?.trend)
     renderResourceTrend(state.data?.trend)
+    renderIndexedTrend(state.data?.trend)
   }, 100)
 })
 loadDashboard()

@@ -26,14 +26,15 @@ record MonitorPoint(String eventId, String metric, String query, Instant occurre
     return Optional.of(new MonitorPoint(eventId, metric, query, timestamp, value));
   }
 
-  /** Return links, queries, failures, and warnings for the minute aggregate. */
+  /** Return links, queries, failures, warnings, and newly indexed contents for the minute aggregate. */
   long[] delta() {
     return switch (metric) {
-      case "dht.resource_discovered" -> new long[]{value, 0, 0, 0};
-      case "dht.query", "dht.query_summary" -> new long[]{0, value, 0, 0};
-      case "metadata.fetch_failed", "collector.failed", "dht.error" -> new long[]{0, 0, value, 0};
-      case "dht.warning" -> new long[]{0, 0, 0, value};
-      default -> new long[]{0, 0, 0, 0};
+      case "dht.resource_discovered" -> new long[]{value, 0, 0, 0, 0};
+      case "dht.query", "dht.query_summary" -> new long[]{0, value, 0, 0, 0};
+      case "metadata.fetch_failed", "collector.failed", "dht.error" -> new long[]{0, 0, value, 0, 0};
+      case "dht.warning" -> new long[]{0, 0, 0, value, 0};
+      case "content.indexed" -> new long[]{0, 0, 0, 0, value};
+      default -> new long[]{0, 0, 0, 0, 0};
     };
   }
 
