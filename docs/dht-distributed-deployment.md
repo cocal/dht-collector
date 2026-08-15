@@ -92,9 +92,7 @@ HINCRBY dht:node:dht-a dht.resource_discovered 1
 HSET dht:node:dht-a last_event_at <timestamp>
 ```
 
-只有 `SET ... NX` 成功时才允许增加计数。Redis Stream 使用 Consumer Group，
-处理成功后再 `XACK`；未确认消息保留在 pending list，可由其他 aggregator
-接管。
+只有 `SET ... NX` 成功时才允许增加计数。
 
 PostgreSQL 仍是业务事实的长期存储，Redis 丢失后可以从 PostgreSQL 和 journal
 重新构建 summary。
@@ -177,23 +175,53 @@ DHT node 1..N
         +--> dashboard instances
 ```
 
-所有节点使用不同的 `node_id`，共享同一个 Redis Stream 和聚合 Consumer
-Group。dashboard 可以部署多个实例，但不能让每个实例重复消费并修改全局
-计数；只有 aggregator 写 summary，dashboard 只读。
+所有节点使用不同的 `node_id`，共享同一个 Redis 实例。每个 bridge 使用事件
+ID 幂等更新全局和节点 summary；dashboard 可以部署多个实例，但只读 summary，
+不会重复修改计数。
 
 ## 一致性和故障处理
 
-- Redis Stream 消费采用至少一次语义，必须依赖幂等去重。
-- aggregator 在计数成功后再 `XACK`；崩溃会导致重试，但不会重复计数。
+- bridge 使用带 TTL 的 `SET ... NX` 做事件幂等去重。
 - dashboard 断线不影响 DHT 采集，重连时重新读取 summary。
-- Redis 不可用时，DHT 主服务继续采集并保留 journal；bridge 恢复后从可用
-  的 journal 起点继续消费。
+- Redis 不可用时，DHT 主服务继续采集并保留 journal；bridge 恢复后继续处理
+  新的 journal 事件。
 - summary 定期与 PostgreSQL 业务事实做校准，发现偏差时允许重建。
 - Redis 不是 PostgreSQL 的替代品，不保存唯一的业务事实。
 
 ## 规模选择
 
-- 几台到几十台节点：Redis Streams + aggregator + SSE。
+- 几台到几十台节点：Redis summary + aggregator + SSE。
 - 数百台节点或每天数十亿事件：Kafka/Kafka Streams 或 ClickHouse 增量物化
   视图，再由 Redis/SSE 提供页面实时状态。
 - 当前数据规模优先使用 Redis 方案，避免直接引入 Kafka、Pinot 或 Druid。
+
+## 当前实现总结（2026-08）
+
+当前监控链路已经与 DHT 主服务解耦：
+
+```text
+dht-passive-collector.service
+        | journal monitor.v1
+        v
+dht-monitor-redis-bridge.service
+        | summary + node hash / Pub/Sub
+        v
+KeyDB/Redis ----> dht-search-dashboard.service ----> SSE browser
+        ^
+dht-redis-monitor.service（健康指标）
+```
+
+Redis 只保存实时监控状态，不保存 content、file_entry 等业务事实：
+
+```text
+dht:summary                         全局统计 Hash
+dht:node:<node_id>                  节点统计 Hash
+dht:dedupe:<event_id>               幂等去重 key，带 TTL
+dht:node:<node_id>:heartbeat        节点心跳，TTL 30 秒
+```
+
+`dht:events` Stream 已移除。当前没有 Stream 消费者，Dashboard 的实时更新使用
+`dht:summary:update` Pub/Sub；PostgreSQL 和 journal 作为长期事实与故障恢复来源。
+
+内存治理原则：去重 key 必须设置 TTL，Redis 不设置无限增长的事件缓存；KeyDB
+使用内存上限和监控告警保护主机，summary 字段保持有限规模。
