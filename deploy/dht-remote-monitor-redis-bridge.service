@@ -1,0 +1,19 @@
+[Unit]
+Description=Remote DHT monitor journal to shared Redis bridge
+After=network-online.target dht-remote-collector.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dht-collector/monitor
+EnvironmentFile=/etc/dht-search/monitor-redis.env
+ExecStart=/usr/bin/python3 /opt/dht-collector/monitor/monitor_redis_bridge.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

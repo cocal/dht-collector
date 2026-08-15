@@ -225,3 +225,26 @@ dht:node:<node_id>:heartbeat        节点心跳，TTL 30 秒
 
 内存治理原则：去重 key 必须设置 TTL，Redis 不设置无限增长的事件缓存；KeyDB
 使用内存上限和监控告警保护主机，summary 字段保持有限规模。
+
+## 104 节点试部署
+
+已验证的第二节点为 `REMOTE_DHT_HOST`，WireGuard 地址为 `10.78.0.104`，本机
+地址为 `10.78.0.166`。双方在现有接口上增加了直连 peer，DHT UDP 端口为
+`51413-51415`。
+
+第二节点运行：
+
+```text
+dht-remote-collector.service
+dht-remote-monitor-redis-bridge.service
+```
+
+第二节点通过本机发起的 SSH 反向隧道访问共享 PostgreSQL 和 Redis，隧道由
+`dht-remote-db-tunnel.service` 保持。collector 使用独立的 `dht-remote-104`
+数据库 ApplicationName 和节点 ID，便于观察连接与节点统计。
+
+任务分发不依赖 Redis：所有 collector 连接同一个 `metadata_job` 表，使用
+`FOR UPDATE SKIP LOCKED` 原子认领任务。这样多个节点可以并行处理同一队列，
+同一个 info-hash 不会被两个 worker 同时执行。当前远端连接池限制为 1，原因是
+现有 PostgreSQL 角色连接额度较小；扩容前应先提高数据库角色连接上限并重新规划
+各服务 pool size。

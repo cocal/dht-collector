@@ -81,7 +81,7 @@ def main():
     journal = subprocess.Popen(
         ["journalctl", "--unit", JOURNAL_UNIT, "--follow", "--output", "json",
          "--no-pager", "--since", "now"],
-        stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1,
+        stdout=subprocess.PIPE, stderr=None, universal_newlines=True, bufsize=1,
     )
     try:
         for line in journal.stdout:

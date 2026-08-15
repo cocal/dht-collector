@@ -1,0 +1,15 @@
+[Unit]
+Description=SSH reverse tunnel for remote DHT collector PostgreSQL access
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -i /root/.ssh/id_ed25519_dht_servers -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -N -R 127.0.0.1:15432:10.77.0.1:5432 -R 127.0.0.1:16379:127.0.0.1:6379 root@REMOTE_DHT_HOST
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

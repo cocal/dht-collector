@@ -1,0 +1,22 @@
+[Unit]
+Description=Remote Mainline DHT collector and shared metadata worker
+After=network-online.target dht-remote-db-tunnel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dht-collector
+EnvironmentFile=/etc/dht-search/db.env
+ExecStart=/usr/bin/java -Xms64m -Xmx512m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -jar /opt/dht-collector/dht-collector-java.jar --mode collector --address 0.0.0.0 --port 51413 --dht-nodes 3 --max-concurrent 32 --metadata-concurrent 8 --metadata-timeout-seconds 20 --pool-size 1 --storage-path /var/lib/dht-collector/java-dht
+Restart=on-failure
+RestartSec=15
+SuccessExitStatus=143
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65536
+MemoryHigh=650M
+MemoryMax=750M
+
+[Install]
+WantedBy=multi-user.target
