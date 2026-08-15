@@ -23,6 +23,7 @@ APPLY_EVENT = """
 if redis.call('SET', KEYS[1], '1', 'NX', 'EX', ARGV[5]) then
   redis.call('HINCRBY', KEYS[2], ARGV[1], ARGV[2])
   redis.call('HINCRBY', KEYS[3], ARGV[1], ARGV[2])
+  redis.call('HSET', KEYS[2], 'last_event_at', ARGV[4])
   redis.call('HSET', KEYS[3], 'node_id', ARGV[3], 'last_event_at', ARGV[4])
   return 1
 end

@@ -488,6 +488,25 @@ function changeContentPage(delta) {
   else loadCatalogPage(page)
 }
 
+function connectLiveSummary() {
+  if (!window.EventSource) return
+  const stream = new EventSource(apiUrl('api/stream'))
+  stream.onmessage = (message) => {
+    try {
+      const payload = JSON.parse(message.data)
+      if (!state.data || !payload.summary) return
+      state.data.summary = payload.summary
+      renderSummary(payload.summary)
+      $('#connection-state').innerHTML = '<i></i> 实时连接'
+      $('#connection-state').className = 'connection-state online'
+    } catch (_) { /* Ignore malformed optional monitor events. */ }
+  }
+  stream.onerror = () => {
+    stream.close()
+    setTimeout(connectLiveSummary, 5000)
+  }
+}
+
 $('#refresh-button').addEventListener('click', loadDashboard)
 $('#sniffer-toggle').addEventListener('change', toggleSniffer)
 $('#event-filter').addEventListener('change', (event) => { state.filter = event.target.value; renderEvents(state.data?.probes || []) })
@@ -504,4 +523,5 @@ window.addEventListener('resize', () => {
   }, 100)
 })
 loadDashboard()
-setInterval(loadDashboard, 8000)
+connectLiveSummary()
+setInterval(loadDashboard, 30000)

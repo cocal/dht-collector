@@ -14,16 +14,21 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisPooled;
+import redis.clients.jedis.JedisPubSub;
 
 final class DashboardServer implements AutoCloseable {
   private final Catalog catalog;
   private final Config config;
   private final ObjectMapper mapper = new ObjectMapper();
   private final HttpServer server;
+  private final JedisPooled redis;
 
   DashboardServer(Catalog catalog, Config config) throws IOException {
     this.catalog = catalog;
     this.config = config;
+    this.redis = connectRedis(config.redisUrl());
     server = HttpServer.create(new InetSocketAddress(config.httpHost(), config.httpPort()), 128);
     server.createContext("/", this::handle);
     server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
@@ -35,6 +40,7 @@ final class DashboardServer implements AutoCloseable {
     try {
       String path = exchange.getRequestURI().getPath();
       if (path.equals("/api/health")) { json(exchange, 200, Map.of("ok", true)); return; }
+      if (path.equals("/api/stream")) { stream(exchange); return; }
       if (path.equals("/api/sniffer")) { handleSniffer(exchange); return; }
       if (path.equals("/api/dashboard")) { int limit = bounded(query(exchange, "limit", 80), 1, 200, 80); json(exchange, 200, dashboard(limit)); return; }
       if (path.equals("/api/content")) { page(exchange, null); return; }
@@ -56,8 +62,60 @@ final class DashboardServer implements AutoCloseable {
     trend.put("bucket_seconds", 60);
     trend.put("buckets", buckets);
     Map<String,Object> result = new LinkedHashMap<>();
-    result.put("summary", catalog.dashboardSummary()); result.put("trend", trend);
+    result.put("summary", redisSummary()); result.put("trend", trend);
     result.put("probes", catalog.recentProbes(limit)); result.put("content", catalog.contentPage(limit, 0)); return result;
+  }
+
+  private Map<String,Object> redisSummary() throws Exception {
+    if (redis == null) return catalog.dashboardSummary();
+    Map<String, String> raw = redis.hgetAll("dht:summary");
+    Map<String, Object> result = new LinkedHashMap<>();
+    result.put("content", number(raw.get("content.indexed")));
+    result.put("files", number(raw.get("content.files")));
+    result.put("probes", number(raw.get("dht.query_received")) + number(raw.get("dht.query_summary")));
+    result.put("peers", number(raw.get("dht.peer_discovered")));
+    result.put("lookups", number(raw.get("dht.lookup_completed")));
+    result.put("discovered", number(raw.get("dht.resource_discovered")));
+    result.put("active_discovered", number(raw.get("active_discovered")));
+    result.put("invalid_discovered", number(raw.get("invalid_discovered")));
+    result.put("last_event_at", raw.get("last_event_at"));
+    return result;
+  }
+
+  private void stream(HttpExchange exchange) throws IOException {
+    if (redis == null) { json(exchange, 503, Map.of("error", "REDIS_URL is not configured")); return; }
+    exchange.getResponseHeaders().set("Content-Type", "text/event-stream; charset=utf-8");
+    exchange.getResponseHeaders().set("Cache-Control", "no-cache");
+    exchange.getResponseHeaders().set("Connection", "keep-alive");
+    exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+    exchange.sendResponseHeaders(200, 0);
+    try (var output = exchange.getResponseBody(); Jedis subscriber = new Jedis(java.net.URI.create(config.redisUrl()))) {
+      writeSse(output, Map.of("summary", redisSummary()));
+      subscriber.subscribe(new JedisPubSub() {
+        @Override public void onMessage(String channel, String message) {
+          try { writeSse(output, Map.of("event", mapper.readValue(message, Map.class), "summary", redisSummary())); }
+          catch (Exception error) { unsubscribe(); }
+        }
+      }, "dht:summary:update");
+    } catch (Exception ignored) {
+      // Client disconnects are normal for SSE connections.
+    }
+  }
+
+  private static void writeSse(java.io.OutputStream output, Object value) throws IOException {
+    output.write(("data: " + new ObjectMapper().writeValueAsString(value) + "\n\n").getBytes(StandardCharsets.UTF_8));
+    output.flush();
+  }
+
+  private static long number(String value) {
+    try { return value == null ? 0 : Long.parseLong(value); }
+    catch (NumberFormatException ignored) { return 0; }
+  }
+
+  private static JedisPooled connectRedis(String url) {
+    if (url == null || url.isBlank()) return null;
+    try { JedisPooled client = new JedisPooled(java.net.URI.create(url)); client.ping(); return client; }
+    catch (Exception ignored) { return null; }
   }
 
   private void page(HttpExchange exchange, String search) throws Exception {
@@ -112,5 +170,5 @@ final class DashboardServer implements AutoCloseable {
   private static String query(HttpExchange exchange, String name, String fallback) { String raw = exchange.getRequestURI().getQuery(); if (raw != null) for (String part : raw.split("&")) { String[] pair = part.split("=",2); if (pair.length == 2 && pair[0].equals(name)) return java.net.URLDecoder.decode(pair[1], StandardCharsets.UTF_8); } return fallback; }
   private static int query(HttpExchange exchange, String name, int fallback) { try { return Integer.parseInt(query(exchange, name, Integer.toString(fallback))); } catch (Exception ignored) { return fallback; } }
   private static int bounded(int value, int min, int max, int fallback) { return value < min || value > max ? fallback : value; }
-  @Override public void close() { server.stop(1); }
+  @Override public void close() { server.stop(1); if (redis != null) redis.close(); }
 }
