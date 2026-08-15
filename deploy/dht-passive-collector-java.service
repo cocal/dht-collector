@@ -1,6 +1,6 @@
 [Unit]
 Description=Mainline DHT collector and metadata worker (Java)
-After=network-online.target dht-search-dashboard.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
