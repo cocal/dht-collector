@@ -109,6 +109,10 @@ final class DashboardServer implements AutoCloseable {
         result.put(service, state.isBlank() ? "unknown" : state);
       } catch (Exception error) { result.put(service, "unknown"); }
     }
+    try (var connection = catalog.connection(); var statement = connection.createStatement()) {
+      statement.execute("SELECT 1");
+      result.put("postgresql", "active");
+    } catch (Exception error) { result.put("postgresql", "inactive"); }
     return result;
   }
 
