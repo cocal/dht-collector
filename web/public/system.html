@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DHT System Monitor</title><link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="system.css">
+</head>
+<body>
+  <div class="app-shell system-shell">
+    <header class="topbar"><a class="brand" href="./"><span class="brand-mark" aria-hidden="true"></span><span class="brand-copy"><strong>DHT System</strong><small>Runtime Monitor</small></span></a><span class="connection-state" id="connection-state"><i></i>连接中</span></header>
+    <main class="system-main">
+      <div class="system-heading"><div><p class="eyebrow">SYSTEM MONITOR</p><h1>当前部署状态</h1></div><span class="system-time" id="updated-at">—</span></div>
+      <section class="architecture-panel"><div class="panel-heading"><div><p class="eyebrow">ARCHITECTURE</p><h2>实时链路</h2></div><span class="status-badge" id="overall-state"><i></i>检查中</span></div><div class="architecture" id="architecture" aria-label="DHT 当前部署架构"><div class="arch-node" data-service="dht-passive-collector.service"><strong>DHT Collector</strong><small>采集与 metadata</small><em>检查中</em></div><span class="arch-link"></span><div class="arch-node" data-service="dht-monitor-redis-bridge.service"><strong>Monitor Bridge</strong><small>Journal -> Redis</small><em>检查中</em></div><span class="arch-link"></span><div class="arch-node" data-service="keydb.service"><strong>Redis / KeyDB</strong><small>实时状态与事件</small><em>检查中</em></div><span class="arch-link"></span><div class="arch-node" data-service="dht-search-dashboard.service"><strong>Dashboard</strong><small>API + SSE</small><em>检查中</em></div></div></section>
+      <section class="system-grid"><article class="system-card"><p class="eyebrow">REDIS / KEYDB</p><h2>基础信息</h2><dl class="system-list"><div><dt>状态</dt><dd id="redis-status">—</dd></div><div><dt>版本</dt><dd id="redis-version">—</dd></div><div><dt>连接数</dt><dd id="redis-clients">—</dd></div><div><dt>Key 数</dt><dd id="redis-keys">—</dd></div><div><dt>Summary 字段</dt><dd id="redis-fields">—</dd></div><div><dt>事件流长度</dt><dd id="redis-stream">—</dd></div><div><dt>内存</dt><dd id="redis-memory">—</dd></div><div><dt>运行时间</dt><dd id="redis-uptime">—</dd></div></dl></article><article class="system-card"><p class="eyebrow">HOST</p><h2>主机资源</h2><dl class="system-list"><div><dt>内存</dt><dd id="host-memory">—</dd></div><div><dt>Swap</dt><dd id="host-swap">—</dd></div><div><dt>磁盘</dt><dd id="host-disk">—</dd></div></dl></article></section>
+    </main>
+  </div>
+  <script src="system.js"></script>
+</body>
+</html>

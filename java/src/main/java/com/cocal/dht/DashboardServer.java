@@ -13,6 +13,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPooled;
@@ -41,6 +42,7 @@ final class DashboardServer implements AutoCloseable {
     try {
       String path = exchange.getRequestURI().getPath();
       if (path.equals("/api/health")) { json(exchange, 200, Map.of("ok", true)); return; }
+      if (path.equals("/api/system")) { json(exchange, 200, systemSnapshot()); return; }
       if (path.equals("/api/stream")) { stream(exchange); return; }
       if (path.equals("/api/sniffer")) { handleSniffer(exchange); return; }
       if (path.equals("/api/dashboard")) { int limit = bounded(query(exchange, "limit", 80), 1, 200, 80); json(exchange, 200, dashboard(limit)); return; }
@@ -86,6 +88,80 @@ final class DashboardServer implements AutoCloseable {
     result.put("redis_connected_clients", number(raw.get("redis.connected_clients")));
     result.put("redis_events_stream_length", number(raw.get("redis.events_stream_length")));
     return result;
+  }
+
+  private Map<String,Object> systemSnapshot() {
+    Map<String,Object> result = new LinkedHashMap<>();
+    result.put("services", serviceStatuses());
+    result.put("host", hostSnapshot());
+    result.put("redis", redisSnapshot());
+    return result;
+  }
+
+  private Map<String,String> serviceStatuses() {
+    Map<String,String> result = new LinkedHashMap<>();
+    for (String service : List.of("dht-passive-collector.service", "dht-monitor-redis-bridge.service",
+        "keydb.service", "dht-search-dashboard.service")) {
+      try {
+        Process process = new ProcessBuilder("systemctl", "is-active", service).start();
+        String state = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        process.waitFor();
+        result.put(service, state.isBlank() ? "unknown" : state);
+      } catch (Exception error) { result.put(service, "unknown"); }
+    }
+    return result;
+  }
+
+  private Map<String,Object> hostSnapshot() {
+    Map<String,Object> result = new LinkedHashMap<>();
+    try {
+      Map<String,Object> memory = new LinkedHashMap<>();
+      for (String line : Files.readAllLines(Path.of("/proc/meminfo"))) {
+        String[] parts = line.split("\\s+");
+        if (parts.length >= 2 && Set.of("MemTotal:", "MemAvailable:", "SwapTotal:", "SwapFree:").contains(parts[0])) {
+          memory.put(parts[0].replace(":", "").toLowerCase(), Long.parseLong(parts[1]) * 1024L);
+        }
+      }
+      result.put("memory", memory);
+    } catch (Exception error) { result.put("memory", Map.of()); }
+    try {
+      var store = Files.getFileStore(Path.of("/"));
+      result.put("disk", Map.of("total", store.getTotalSpace(), "free", store.getUsableSpace()));
+    } catch (Exception error) { result.put("disk", Map.of()); }
+    return result;
+  }
+
+  private Map<String,Object> redisSnapshot() {
+    if (redis == null) return Map.of("available", false);
+    try {
+      String infoText;
+      String clientList;
+      try (Jedis client = new Jedis(java.net.URI.create(config.redisUrl()))) {
+        infoText = client.info();
+        clientList = client.clientList();
+      }
+      Map<String,String> info = parseInfo(infoText);
+      Map<String,Object> result = new LinkedHashMap<>();
+      result.put("available", true); result.put("version", info.getOrDefault("redis_version", "unknown"));
+      result.put("uptime_seconds", number(info.get("uptime_in_seconds")));
+      result.put("used_memory_bytes", number(info.get("used_memory")));
+      result.put("peak_memory_bytes", number(info.get("used_memory_peak")));
+      result.put("connected_clients", number(info.get("connected_clients")));
+      result.put("blocked_clients", number(info.get("blocked_clients")));
+      result.put("keys", redis.dbSize()); result.put("summary_fields", redis.hlen("dht:summary"));
+      result.put("event_stream_length", redis.xlen("dht:events"));
+      result.put("client_list_entries", clientList.isBlank() ? 0 : clientList.lines().count());
+      return result;
+    } catch (Exception error) { return Map.of("available", false, "error", error.getMessage()); }
+  }
+
+  private static Map<String,String> parseInfo(String text) {
+    Map<String,String> values = new LinkedHashMap<>();
+    for (String line : text.split("\\R")) {
+      int split = line.indexOf(':');
+      if (split > 0) values.put(line.substring(0, split), line.substring(split + 1));
+    }
+    return values;
   }
 
   private void seedLegacyCounters() {
