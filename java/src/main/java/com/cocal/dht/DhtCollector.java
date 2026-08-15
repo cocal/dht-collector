@@ -39,6 +39,8 @@ final class DhtCollector implements AutoCloseable {
   static final int DIRECT_FALLBACK_PRIORITY = LIVE_METADATA_PRIORITY;
   static final int DIRECT_FALLBACK_DELAY_SECONDS = 5;
   static final int MAX_ANNOUNCE_ENDPOINTS = 6;
+  static final int MAX_ANNOUNCED_PEER_HASHES = 50_000;
+  static final int MAX_PENDING_TOUCHES = 50_000;
   static final int OBSERVATION_BATCH_SIZE = 256;
   static final long OBSERVATION_FLUSH_MILLIS = 100;
   private static final long INCOMING_NODE_PROBE_INTERVAL_NANOS =
@@ -111,6 +113,7 @@ final class DhtCollector implements AutoCloseable {
       try {
         flushTouches();
         cache.prune(System.currentTimeMillis());
+        pruneAnnouncedPeers(System.currentTimeMillis());
         flushQueries();
       } catch (Exception error) {
         monitor.metric("collector.failed", 1);
@@ -204,7 +207,7 @@ final class DhtCollector implements AutoCloseable {
     if (cache.contains(observation.infoHash(), observedAt)) {
       cache.observe(observation.infoHash(), observedAt);
       if (!observation.isAnnounce()) {
-        pendingTouches.put(observation.infoHash(), observation.observedAt());
+        queuePendingTouch(observation.infoHash(), observation.observedAt());
         return;
       }
     } else if (config.maxResources() > 0 && discovered.get() >= config.maxResources()) {
@@ -255,6 +258,19 @@ final class DhtCollector implements AutoCloseable {
     Map<String, Instant> copy = new HashMap<>(pendingTouches);
     catalog.touch(copy);
     copy.forEach((hash, observedAt) -> pendingTouches.remove(hash, observedAt));
+  }
+
+  private void queuePendingTouch(String infoHash, Instant observedAt) {
+    if (pendingTouches.containsKey(infoHash)) {
+      pendingTouches.merge(infoHash, observedAt,
+          (existing, newer) -> newer.isAfter(existing) ? newer : existing);
+      return;
+    }
+    if (pendingTouches.size() >= MAX_PENDING_TOUCHES) {
+      monitor.metric("collector.pending_touches_dropped", 1);
+      return;
+    }
+    pendingTouches.putIfAbsent(infoHash, observedAt);
   }
 
   private void pollMetadataJobs() throws Exception {
@@ -430,6 +446,28 @@ final class DhtCollector implements AutoCloseable {
       while (peers.size() > MAX_ANNOUNCE_ENDPOINTS) peers.remove(peers.keySet().iterator().next());
       return peers;
     });
+  }
+
+  private void pruneAnnouncedPeers(long now) {
+    long cutoff = now - ANNOUNCE_PEER_TTL_MS;
+    for (var entry : announcedPeers.entrySet()) {
+      Map<InetSocketAddress, PeerHint> current = entry.getValue();
+      Map<InetSocketAddress, PeerHint> active = new LinkedHashMap<>();
+      current.forEach((endpoint, hint) -> {
+        if (hint.observedAt() >= cutoff) active.put(endpoint, hint);
+      });
+      if (active.isEmpty()) announcedPeers.remove(entry.getKey(), current);
+      else if (active.size() != current.size()) announcedPeers.replace(entry.getKey(), current, active);
+    }
+    int excess = announcedPeers.size() - MAX_ANNOUNCED_PEER_HASHES;
+    if (excess > 0) {
+      announcedPeers.entrySet().stream()
+          .sorted(java.util.Comparator.comparingLong(entry -> entry.getValue().values().stream()
+              .mapToLong(PeerHint::observedAt).max().orElse(Long.MIN_VALUE)))
+          .limit(excess)
+          .map(Map.Entry::getKey)
+          .forEach(announcedPeers::remove);
+    }
   }
 
   static List<InetSocketAddress> announceEndpoints(InetSocketAddress origin, int advertisedPort) {
