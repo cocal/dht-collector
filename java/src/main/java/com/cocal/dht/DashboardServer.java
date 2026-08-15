@@ -29,6 +29,7 @@ final class DashboardServer implements AutoCloseable {
     this.catalog = catalog;
     this.config = config;
     this.redis = connectRedis(config.redisUrl());
+    seedLegacyCounters();
     server = HttpServer.create(new InetSocketAddress(config.httpHost(), config.httpPort()), 128);
     server.createContext("/", this::handle);
     server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
@@ -70,12 +71,12 @@ final class DashboardServer implements AutoCloseable {
     if (redis == null) return catalog.dashboardSummary();
     Map<String, String> raw = redis.hgetAll("dht:summary");
     Map<String, Object> result = new LinkedHashMap<>();
-    result.put("content", number(raw.get("content.indexed")));
-    result.put("files", number(raw.get("content.files")));
-    result.put("probes", number(raw.get("dht.query_received")) + number(raw.get("dht.query_summary")));
-    result.put("peers", number(raw.get("dht.peer_discovered")));
-    result.put("lookups", number(raw.get("dht.lookup_completed")));
-    result.put("discovered", number(raw.get("dht.resource_discovered")));
+    result.put("content", number(raw.get("content")));
+    result.put("files", number(raw.get("files")));
+    result.put("probes", number(raw.get("probes")));
+    result.put("peers", number(raw.get("peers")));
+    result.put("lookups", number(raw.get("lookups")));
+    result.put("discovered", number(raw.get("discovered")));
     result.put("active_discovered", number(raw.get("active_discovered")));
     result.put("invalid_discovered", number(raw.get("invalid_discovered")));
     result.put("last_event_at", raw.get("last_event_at"));
@@ -85,6 +86,19 @@ final class DashboardServer implements AutoCloseable {
     result.put("redis_connected_clients", number(raw.get("redis.connected_clients")));
     result.put("redis_events_stream_length", number(raw.get("redis.events_stream_length")));
     return result;
+  }
+
+  private void seedLegacyCounters() {
+    if (redis == null) return;
+    try {
+      for (String name : new String[]{"content", "files", "probes", "peers", "lookups", "discovered"}) {
+        long catalogValue = catalog.counterValue(name);
+        String current = redis.hget("dht:summary", name);
+        if (current == null || number(current) < catalogValue) {
+          redis.hset("dht:summary", name, Long.toString(catalogValue));
+        }
+      }
+    } catch (Exception ignored) { }
   }
 
   private void stream(HttpExchange exchange) throws IOException {
