@@ -162,6 +162,21 @@ bridge 的环境变量位于 `/etc/dht-search/monitor-redis.env`，至少应为�
 采集节点设置唯一的 `DHT_NODE_ID`。停用监控时只需停止并禁用 bridge 和
 dashboard，`dht-passive-collector.service` 不需要修改或重启。
 
+Redis 本身的健康检查由可选的 `dht-redis-monitor.service` 提供。它每 30 秒
+输出以下 `monitor.v1` 指标到 journal：
+
+```text
+redis.up
+redis.error
+redis.latency_ms
+redis.used_memory_bytes
+redis.connected_clients
+redis.events_stream_length
+```
+
+Redis 不可用时，检查服务仍会记录 `redis.error`；它不会依赖 Redis 写回自身，
+因此外部 monitor-center 可以从 `dht-redis-monitor.service` journal 发现故障。
+
 ### 多节点模式
 
 ```text

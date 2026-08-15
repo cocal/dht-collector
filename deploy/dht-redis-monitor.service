@@ -1,0 +1,19 @@
+[Unit]
+Description=Optional Redis health monitor for DHT observability
+After=network-online.target keydb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/vibe/dht-collector
+EnvironmentFile=-/etc/dht-search/monitor-redis.env
+ExecStart=/usr/bin/python3 /root/vibe/dht-collector/monitor/redis_monitor.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
