@@ -79,6 +79,11 @@ final class DashboardServer implements AutoCloseable {
     result.put("active_discovered", number(raw.get("active_discovered")));
     result.put("invalid_discovered", number(raw.get("invalid_discovered")));
     result.put("last_event_at", raw.get("last_event_at"));
+    result.put("redis_up", number(raw.get("redis.up")) > 0);
+    result.put("redis_latency_ms", number(raw.get("redis.latency_ms")));
+    result.put("redis_used_memory_bytes", number(raw.get("redis.used_memory_bytes")));
+    result.put("redis_connected_clients", number(raw.get("redis.connected_clients")));
+    result.put("redis_events_stream_length", number(raw.get("redis.events_stream_length")));
     return result;
   }
 

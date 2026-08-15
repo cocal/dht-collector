@@ -47,6 +47,11 @@ function renderSummary(summary) {
   if (!state.search) $('#content-count').textContent = formatNumber(summary.content)
   $('#status-collector').textContent = summary.discovered ? `${formatNumber(summary.discovered)} 个 Infohash 已发现` : '等待 DHT 请求'
   $('#status-metadata').textContent = summary.content ? '内容已入库' : '等待结果'
+  const redisUp = summary.redis_up === true
+  $('#status-redis').textContent = redisUp ? '正常' : '不可用'
+  $('#redis-latency').textContent = redisUp ? `${formatNumber(summary.redis_latency_ms)} ms` : '—'
+  $('#redis-memory').textContent = redisUp ? formatBytes(summary.redis_used_memory_bytes) : '—'
+  $('#redis-stream-length').textContent = redisUp ? formatNumber(summary.redis_events_stream_length) : '—'
 }
 
 function renderTrend(trend) {

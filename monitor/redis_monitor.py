@@ -26,6 +26,15 @@ def emit(metric, value, **extra):
     }
     event.update(extra)
     print(json.dumps(event, separators=(",", ":")), flush=True)
+    return event
+
+
+def publish(client, event):
+    try:
+        client.hset("dht:summary", event["metric"], event["value"])
+        client.publish("dht:summary:update", json.dumps(event, separators=(",", ":")))
+    except redis.RedisError:
+        pass
 
 
 def main():
@@ -37,11 +46,11 @@ def main():
             client.ping()
             latency_ms = round((time.monotonic() - started) * 1000)
             info = client.info()
-            emit("redis.up", 1)
-            emit("redis.latency_ms", latency_ms)
-            emit("redis.used_memory_bytes", info.get("used_memory", 0))
-            emit("redis.connected_clients", info.get("connected_clients", 0))
-            emit("redis.events_stream_length", client.xlen(STREAM))
+            for metric, value in (("redis.up", 1), ("redis.latency_ms", latency_ms),
+                                  ("redis.used_memory_bytes", info.get("used_memory", 0)),
+                                  ("redis.connected_clients", info.get("connected_clients", 0)),
+                                  ("redis.events_stream_length", client.xlen(STREAM))):
+                publish(client, emit(metric, value))
         except Exception as error:
             print(f"redis monitor error: {error}", flush=True)
             emit("redis.error", 1, message=str(error)[:200])
