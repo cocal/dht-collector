@@ -237,6 +237,9 @@ final class DhtCollector implements AutoCloseable {
           discovered.addAndGet(fresh);
           monitor.metric("dht.resource_discovered", fresh);
         }
+        if (write.peerFacts() > 0) {
+          monitor.metric("dht.peer_discovered", write.peerFacts());
+        }
         if (!stopping) write.immediateHashes().forEach(this::startMetadataForAnnounce);
       } catch (Exception error) {
         monitor.metric("collector.failed", 1);

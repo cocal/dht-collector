@@ -35,7 +35,7 @@ final class Catalog implements AutoCloseable {
   private final Map<String, AtomicLong> pendingCounters = new ConcurrentHashMap<>();
 
   record ManifestWrite(boolean inserted, boolean changed) {}
-  record ObservationWrite(Set<String> freshHashes, Set<String> immediateHashes) {}
+  record ObservationWrite(Set<String> freshHashes, Set<String> immediateHashes, int peerFacts) {}
 
   Catalog(String url, String user, String password, int poolSize) {
     URI parsed = parseUri(url);
@@ -158,7 +158,7 @@ final class Catalog implements AutoCloseable {
   /** Persist a coalesced DHT intake batch in one transaction and one pooled connection. */
   ObservationWrite persistObservations(List<DhtObservation> observations) throws SQLException {
     if (observations == null || observations.isEmpty()) {
-      return new ObservationWrite(Set.of(), Set.of());
+      return new ObservationWrite(Set.of(), Set.of(), 0);
     }
     var fresh = new java.util.LinkedHashSet<String>();
     var immediate = new java.util.LinkedHashSet<String>();
@@ -256,7 +256,7 @@ final class Catalog implements AutoCloseable {
     queueCounter("discovered", fresh.size());
     queueCounter("probes", factCount);
     queueCounter("peers", peerFacts);
-    return new ObservationWrite(Set.copyOf(fresh), Set.copyOf(immediate));
+    return new ObservationWrite(Set.copyOf(fresh), Set.copyOf(immediate), peerFacts);
   }
 
   private static boolean statementChanged(int count) {
