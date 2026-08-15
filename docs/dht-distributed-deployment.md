@@ -149,6 +149,19 @@ dht-search-dashboard.service
 PostgreSQL
 ```
 
+当前仓库提供可选的 `deploy/dht-monitor-redis-bridge.service`。在 systemd 主机
+上启用监控旁路：
+
+```bash
+dnf install keydb python3-redis
+systemctl enable --now keydb.service
+systemctl enable --now dht-monitor-redis-bridge.service
+```
+
+bridge 的环境变量位于 `/etc/dht-search/monitor-redis.env`，至少应为每个
+采集节点设置唯一的 `DHT_NODE_ID`。停用监控时只需停止并禁用 bridge 和
+dashboard，`dht-passive-collector.service` 不需要修改或重启。
+
 ### 多节点模式
 
 ```text
@@ -180,4 +193,3 @@ Group。dashboard 可以部署多个实例，但不能让每个实例重复消�
 - 数百台节点或每天数十亿事件：Kafka/Kafka Streams 或 ClickHouse 增量物化
   视图，再由 Redis/SSE 提供页面实时状态。
 - 当前数据规模优先使用 Redis 方案，避免直接引入 Kafka、Pinot 或 Druid。
-
