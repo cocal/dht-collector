@@ -134,6 +134,9 @@ java -jar target/dht-collector-java-0.1.0.jar \
   --static-path ../web/public
 ```
 
+分布式节点、Redis 实时聚合、幂等消费和 dashboard SSE 的部署设计见
+[`docs/dht-distributed-deployment.md`](docs/dht-distributed-deployment.md)。
+
 The Java service uses the existing PostgreSQL catalog, including
 `discovered_resource`, `probe_event`, `metadata_job`, `content`, and
 `file_entry`. It keeps only resources seen in the last 24 hours resident,
