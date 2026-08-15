@@ -92,6 +92,7 @@ final class DhtCollector implements AutoCloseable {
         DHT dht = new DHT(DHTtype.IPV4_DHT);
         dht.addIncomingMessageListener(this::onIncomingMessage);
         dht.start(configuration(port, config.storagePath().resolve("node-" + port)));
+        seedConfiguredBootstrap(dht);
         nodes.add(dht);
       }
       metadata = new MetadataFetcher(nodes, config.metadataConcurrent(), config.metadataTimeoutSeconds(),
@@ -359,6 +360,26 @@ final class DhtCollector implements AutoCloseable {
       if (gate.compareAndSet(allowedAt, now + INCOMING_NODE_PROBE_INTERVAL_NANOS)) break;
     }
     dht.addDHTNode(source.getAddress().getHostAddress(), source.getPort());
+  }
+
+  private void seedConfiguredBootstrap(DHT dht) {
+    String configured = System.getenv("DHT_BOOTSTRAP");
+    if (configured == null || configured.isBlank()) return;
+    for (String value : configured.split(",")) {
+      String endpoint = value.trim();
+      int separator = endpoint.lastIndexOf(':');
+      if (separator <= 0 || separator == endpoint.length() - 1) continue;
+      try {
+        String host = endpoint.substring(0, separator).trim();
+        int port = Integer.parseInt(endpoint.substring(separator + 1).trim());
+        InetAddress address = InetAddress.getByName(host);
+        if (port > 0 && port <= 65535 && address.getAddress().length == 4) {
+          dht.addDHTNode(address.getHostAddress(), port);
+        }
+      } catch (Exception ignored) {
+        System.err.println("DHT bootstrap endpoint unavailable: " + endpoint);
+      }
+    }
   }
 
   private void startMetadataForAnnounce(String infoHash) {
