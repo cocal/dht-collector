@@ -239,9 +239,9 @@ dht-remote-collector.service
 dht-remote-monitor-redis-bridge.service
 ```
 
-第二节点通过本机发起的 SSH 反向隧道访问共享 PostgreSQL 和 Redis，隧道由
-`dht-remote-db-tunnel.service` 保持。collector 使用独立的 `dht-remote-104`
-数据库 ApplicationName 和节点 ID，便于观察连接与节点统计。
+第二节点通过 WireGuard 直接访问共享 PostgreSQL（`10.77.0.1:5432`）和本机
+KeyDB（`10.78.0.166:6379`），不依赖 SSH 反向隧道。collector 使用独立的
+`dht-remote-104` 数据库 ApplicationName 和节点 ID，便于观察连接与节点统计。
 
 任务分发不依赖 Redis：所有 collector 连接同一个 `metadata_job` 表，使用
 `FOR UPDATE SKIP LOCKED` 原子认领任务。这样多个节点可以并行处理同一队列，

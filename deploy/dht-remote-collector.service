@@ -1,6 +1,6 @@
 [Unit]
 Description=Remote Mainline DHT collector and shared metadata worker
-After=network-online.target dht-remote-db-tunnel.service
+After=network-online.target wg-quick@monitor-center.service
 Wants=network-online.target
 
 [Service]

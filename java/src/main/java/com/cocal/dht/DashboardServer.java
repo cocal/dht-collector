@@ -94,7 +94,31 @@ final class DashboardServer implements AutoCloseable {
     result.put("services", serviceStatuses());
     result.put("host", hostSnapshot());
     result.put("redis", redisSnapshot());
+    result.put("nodes", nodeSnapshots());
     return result;
+  }
+
+  private Map<String,Object> nodeSnapshots() {
+    if (redis == null) return Map.of();
+    try {
+      Set<String> ids = new java.util.TreeSet<>();
+      for (String key : redis.keys("dht:node:*") ) {
+        String suffix = key.substring("dht:node:".length());
+        ids.add(suffix.endsWith(":heartbeat") ? suffix.substring(0, suffix.length() - ":heartbeat".length()) : suffix);
+      }
+      Map<String,Object> result = new LinkedHashMap<>();
+      for (String id : ids) {
+        Map<String,String> raw = redis.hgetAll("dht:node:" + id);
+        Map<String,Object> node = new LinkedHashMap<>();
+        node.put("completed", number(raw.get("metadata.fetch_completed")));
+        node.put("failed", number(raw.get("metadata.fetch_failed")));
+        node.put("indexed", number(raw.get("content.indexed")));
+        node.put("last_event_at", raw.get("last_event_at"));
+        node.put("heartbeat_ttl", redis.ttl("dht:node:" + id + ":heartbeat"));
+        result.put(id, node);
+      }
+      return result;
+    } catch (Exception error) { return Map.of(); }
   }
 
   private Map<String,String> serviceStatuses() {
