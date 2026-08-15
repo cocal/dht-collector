@@ -51,7 +51,6 @@ function renderSummary(summary) {
   $('#status-redis').textContent = redisUp ? '正常' : '不可用'
   $('#redis-latency').textContent = redisUp ? `${formatNumber(summary.redis_latency_ms)} ms` : '—'
   $('#redis-memory').textContent = redisUp ? formatBytes(summary.redis_used_memory_bytes) : '—'
-  $('#redis-stream-length').textContent = redisUp ? formatNumber(summary.redis_events_stream_length) : '—'
 }
 
 function renderTrend(trend) {

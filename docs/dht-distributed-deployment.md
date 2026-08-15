@@ -14,13 +14,11 @@
 
 ```text
 DHT node A ─┐
-DHT node B ─┼──> Redis Stream dht:events
+DHT node B ─┼──> Redis bridge / aggregator
 DHT node C ─┘              |
                            v
-                   monitor aggregator
-                    |             |
-                    v             v
-              dht:summary    dht:node:{id}
+                    dht:summary
+                    dht:node:{id}
                            |
                            v
                     dashboard SSE
@@ -43,8 +41,8 @@ dht-passive-collector.service
 
 ### Redis bridge / aggregator
 
-可选的 bridge 从 journal 或事件输出读取 `monitor.v1`，写入 Redis Stream。
-聚合器使用 Consumer Group 消费 Stream，维护全局和节点维度的 summary。
+可选的 bridge 从 journal 或事件输出读取 `monitor.v1`，使用 event_id 去重后直接
+维护全局和节点维度的 summary，并通过 Pub/Sub 通知 Dashboard。
 
 ### Dashboard
 
@@ -79,14 +77,13 @@ dashboard 首次读取 Redis summary，之后通过 SSE 接收实时变更。Pos
 ## Redis 数据结构
 
 ```text
-dht:events                       Redis Stream，原始事件
 dht:summary                      全局计数 Hash
 dht:node:{node_id}               节点计数和最近状态 Hash
 dht:dedupe:{event_id}            幂等去重键，带 TTL
 dht:node:{node_id}:heartbeat     节点心跳，带过期时间
 ```
 
-事件写入 Stream 后，由 aggregator 执行：
+bridge 聚合事件时执行：
 
 ```text
 SET dht:dedupe:{event_id} 1 NX EX 86400
@@ -99,14 +96,8 @@ HSET dht:node:dht-a last_event_at <timestamp>
 处理成功后再 `XACK`；未确认消息保留在 pending list，可由其他 aggregator
 接管。
 
-Stream 应设置保留上限，例如：
-
-```text
-XTRIM dht:events MAXLEN ~ 1000000
-```
-
-Stream 用于短期重放和 dashboard 断线恢复，PostgreSQL 仍是业务事实的长期
-存储。Redis 丢失后可以从 PostgreSQL 或保留的事件源重建 summary。
+PostgreSQL 仍是业务事实的长期存储，Redis 丢失后可以从 PostgreSQL 和 journal
+重新构建 summary。
 
 ## 节点心跳
 
@@ -124,9 +115,8 @@ SET dht:node:dht-a:heartbeat <unix-seconds> EX 30
 页面打开时：
 
 1. 读取 `dht:summary` 和所有节点状态。
-2. 记录当前 Stream ID。
-3. 通过 SSE 长连接接收后续聚合变更。
-4. 连接断开后重新读取 summary，再从上次 Stream ID 继续消费。
+2. 通过 SSE 长连接接收后续聚合变更。
+3. 连接断开后重新读取 summary。
 
 页面不直接消费每个 DHT 节点的 journal，也不自己累加业务事件。
 
@@ -171,7 +161,6 @@ redis.error
 redis.latency_ms
 redis.used_memory_bytes
 redis.connected_clients
-redis.events_stream_length
 ```
 
 Redis 不可用时，检查服务仍会记录 `redis.error`；它不会依赖 Redis 写回自身，

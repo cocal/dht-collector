@@ -86,7 +86,6 @@ final class DashboardServer implements AutoCloseable {
     result.put("redis_latency_ms", number(raw.get("redis.latency_ms")));
     result.put("redis_used_memory_bytes", number(raw.get("redis.used_memory_bytes")));
     result.put("redis_connected_clients", number(raw.get("redis.connected_clients")));
-    result.put("redis_events_stream_length", number(raw.get("redis.events_stream_length")));
     return result;
   }
 
@@ -153,7 +152,6 @@ final class DashboardServer implements AutoCloseable {
       result.put("connected_clients", number(info.get("connected_clients")));
       result.put("blocked_clients", number(info.get("blocked_clients")));
       result.put("keys", redis.dbSize()); result.put("summary_fields", redis.hlen("dht:summary"));
-      result.put("event_stream_length", redis.xlen("dht:events"));
       result.put("client_list_entries", clientList.isBlank() ? 0 : clientList.lines().count());
       return result;
     } catch (Exception error) { return Map.of("available", false, "error", error.getMessage()); }

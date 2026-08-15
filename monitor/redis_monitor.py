@@ -10,7 +10,6 @@ import redis
 
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
-STREAM = os.getenv("DHT_EVENT_STREAM", "dht:events")
 INTERVAL = max(5, int(os.getenv("REDIS_MONITOR_INTERVAL", "30")))
 SERVICE = os.getenv("REDIS_MONITOR_SERVICE", "dht-redis-monitor")
 
@@ -48,8 +47,7 @@ def main():
             info = client.info()
             for metric, value in (("redis.up", 1), ("redis.latency_ms", latency_ms),
                                   ("redis.used_memory_bytes", info.get("used_memory", 0)),
-                                  ("redis.connected_clients", info.get("connected_clients", 0)),
-                                  ("redis.events_stream_length", client.xlen(STREAM))):
+                                  ("redis.connected_clients", info.get("connected_clients", 0))):
                 publish(client, emit(metric, value))
         except Exception as error:
             print(f"redis monitor error: {error}", flush=True)

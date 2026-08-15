@@ -14,9 +14,7 @@ import redis
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 JOURNAL_UNIT = os.getenv("JOURNAL_UNIT", "dht-passive-collector.service")
 NODE_ID = os.getenv("DHT_NODE_ID", os.uname().nodename)
-STREAM = os.getenv("DHT_EVENT_STREAM", "dht:events")
 SUMMARY = os.getenv("DHT_SUMMARY_KEY", "dht:summary")
-STREAM_MAXLEN = int(os.getenv("DHT_EVENT_MAXLEN", "1000000"))
 DEDUPE_TTL = int(os.getenv("DHT_DEDUPE_TTL", "86400"))
 
 APPLY_EVENT = """
@@ -97,9 +95,6 @@ def main():
             event = dict(event)
             event.update({"node_id": NODE_ID, "boot_id": boot_id, "sequence": sequence})
             event_json = json.dumps(event, separators=(",", ":"), ensure_ascii=False)
-            client.xadd(STREAM, {"event": event_json, "event_id": event["event_id"],
-                                 "node_id": NODE_ID, "metric": event["metric"]},
-                        maxlen=STREAM_MAXLEN, approximate=True)
             node_key = f"dht:node:{NODE_ID}"
             applied = apply_event(keys=[f"dht:dedupe:{event['event_id']}", SUMMARY, node_key],
                                   args=[event["metric"], event["value"], NODE_ID,
