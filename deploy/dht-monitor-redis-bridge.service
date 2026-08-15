@@ -1,0 +1,19 @@
+[Unit]
+Description=Optional DHT monitor journal to Redis bridge
+After=network-online.target keydb.service dht-passive-collector.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/vibe/dht-collector
+EnvironmentFile=-/etc/dht-search/monitor-redis.env
+ExecStart=/usr/bin/python3 /root/vibe/dht-collector/monitor/monitor_redis_bridge.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
