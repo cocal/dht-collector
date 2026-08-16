@@ -25,6 +25,11 @@ final class DashboardServer implements AutoCloseable {
   private final ObjectMapper mapper = new ObjectMapper();
   private final HttpServer server;
   private final JedisPooled redis;
+  private volatile Snapshot dashboardCache;
+  private volatile Snapshot systemCache;
+  private static final long SNAPSHOT_TTL_MS = 3_000;
+
+  private record Snapshot(long createdAt, int limit, Map<String,Object> value) {}
 
   DashboardServer(Catalog catalog, Config config) throws IOException {
     this.catalog = catalog;
@@ -57,6 +62,10 @@ final class DashboardServer implements AutoCloseable {
   }
 
   private Map<String,Object> dashboard(int limit) throws Exception {
+    Snapshot cached = dashboardCache;
+    long now = System.currentTimeMillis();
+    if (cached != null && cached.limit == limit && now - cached.createdAt < SNAPSHOT_TTL_MS) return cached.value;
+    try {
     List<Map<String,Object>> buckets = catalog.trend(5);
     Instant to = Instant.now().truncatedTo(ChronoUnit.MINUTES);
     Map<String,Object> trend = new LinkedHashMap<>();
@@ -66,7 +75,14 @@ final class DashboardServer implements AutoCloseable {
     trend.put("buckets", buckets);
     Map<String,Object> result = new LinkedHashMap<>();
     result.put("summary", redisSummary()); result.put("trend", trend);
-    result.put("probes", catalog.recentProbes(limit)); result.put("content", catalog.contentPage(limit, 0)); return result;
+    result.put("probes", catalog.recentProbes(limit)); result.put("content", catalog.contentPage(limit, 0));
+    Map<String,Object> snapshot = Map.copyOf(result);
+    dashboardCache = new Snapshot(now, limit, snapshot);
+    return snapshot;
+    } catch (Exception error) {
+      if (cached != null) return cached.value;
+      throw error;
+    }
   }
 
   private Map<String,Object> redisSummary() throws Exception {
@@ -90,12 +106,17 @@ final class DashboardServer implements AutoCloseable {
   }
 
   private Map<String,Object> systemSnapshot() {
+    Snapshot cached = systemCache;
+    long now = System.currentTimeMillis();
+    if (cached != null && now - cached.createdAt < SNAPSHOT_TTL_MS) return cached.value;
     Map<String,Object> result = new LinkedHashMap<>();
     result.put("services", serviceStatuses());
     result.put("host", hostSnapshot());
     result.put("redis", redisSnapshot());
     result.put("nodes", nodeSnapshots());
-    return result;
+    Map<String,Object> snapshot = Map.copyOf(result);
+    systemCache = new Snapshot(now, 0, snapshot);
+    return snapshot;
   }
 
   private Map<String,Object> nodeSnapshots() {
@@ -132,10 +153,7 @@ final class DashboardServer implements AutoCloseable {
         result.put(service, state.isBlank() ? "unknown" : state);
       } catch (Exception error) { result.put(service, "unknown"); }
     }
-    try (var connection = catalog.connection(); var statement = connection.createStatement()) {
-      statement.execute("SELECT 1");
-      result.put("postgresql", "active");
-    } catch (Exception error) { result.put("postgresql", "inactive"); }
+    result.put("postgresql", catalog.databaseAvailable() ? "active" : "inactive");
     return result;
   }
 

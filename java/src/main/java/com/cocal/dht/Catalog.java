@@ -50,7 +50,8 @@ final class Catalog implements AutoCloseable {
     config.setMaximumPoolSize(poolSize);
     config.setMinimumIdle(Math.min(1, poolSize));
     config.setPoolName("dht-collector");
-    config.setConnectionTimeout(10_000);
+    // A web request must not wait behind an exhausted pool for ten seconds.
+    config.setConnectionTimeout(2_000);
     config.setValidationTimeout(3_000);
     config.setKeepaliveTime(Duration.ofMinutes(1).toMillis());
     config.setMaxLifetime(Duration.ofMinutes(10).toMillis());
@@ -161,9 +162,14 @@ final class Catalog implements AutoCloseable {
     if (observations == null || observations.isEmpty()) {
       return new ObservationWrite(Set.of(), Set.of(), 0);
     }
+    List<DhtObservation> events = observations;
     observations = observations.stream()
         .sorted(Comparator.comparing(DhtObservation::infoHash).thenComparing(DhtObservation::observedAt))
         .toList();
+    // Keep one row per hash for locking/upsert work. Peer events retain the full intake batch.
+    Map<String, DhtObservation> latestByHash = new TreeMap<>();
+    for (DhtObservation observation : observations) latestByHash.put(observation.infoHash(), observation);
+    List<DhtObservation> resources = List.copyOf(latestByHash.values());
     var fresh = new java.util.LinkedHashSet<String>();
     var immediate = new java.util.LinkedHashSet<String>();
     int peerFacts = 0;
@@ -175,7 +181,7 @@ final class Catalog implements AutoCloseable {
         try (PreparedStatement statement = connection.prepareStatement(
             "INSERT INTO discovered_resource(info_hash,first_seen_at,last_seen_at,source,state) "
                 + "VALUES(?,?,?,?,'active') ON CONFLICT(info_hash) DO NOTHING")) {
-          for (DhtObservation observation : observations) {
+          for (DhtObservation observation : resources) {
             Timestamp at = Timestamp.from(observation.observedAt());
             statement.setString(1, observation.infoHash());
             statement.setTimestamp(2, at);
@@ -186,13 +192,13 @@ final class Catalog implements AutoCloseable {
           inserted = statement.executeBatch();
         }
         for (int index = 0; index < inserted.length; index++) {
-          if (statementChanged(inserted[index])) fresh.add(observations.get(index).infoHash());
+          if (statementChanged(inserted[index])) fresh.add(resources.get(index).infoHash());
         }
 
         try (PreparedStatement statement = connection.prepareStatement(
             "UPDATE discovered_resource SET last_seen_at=greatest(last_seen_at,?),state='active' "
                 + "WHERE info_hash=?")) {
-          for (DhtObservation observation : observations) {
+          for (DhtObservation observation : resources) {
             statement.setTimestamp(1, Timestamp.from(observation.observedAt()));
             statement.setString(2, observation.infoHash());
             statement.addBatch();
@@ -207,7 +213,7 @@ final class Catalog implements AutoCloseable {
                 + "ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,excluded.priority),"
                 + "next_attempt_at=CASE WHEN ? THEN least(metadata_job.next_attempt_at,excluded.next_attempt_at) "
                 + "ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at")) {
-          for (DhtObservation observation : observations) {
+          for (DhtObservation observation : resources) {
             int priority = observation.isAnnounce() ? 100 : 10;
             Timestamp at = Timestamp.from(observation.observedAt());
             statement.setString(1, observation.infoHash());
@@ -222,7 +228,7 @@ final class Catalog implements AutoCloseable {
           queued = statement.executeBatch();
         }
         for (int index = 0; index < queued.length; index++) {
-          DhtObservation observation = observations.get(index);
+          DhtObservation observation = resources.get(index);
           if (observation.isAnnounce() && statementChanged(queued[index])) {
             immediate.add(observation.infoHash());
           }
@@ -232,7 +238,7 @@ final class Catalog implements AutoCloseable {
             "INSERT INTO probe_event(event_id,event_type,occurred_at,info_hash,peer_host,peer_port,"
                 + "source_host,source_port,mode,raw_event) VALUES(?,?,?,?,?,?,?,?,?,?::jsonb) "
                 + "ON CONFLICT DO NOTHING")) {
-          for (DhtObservation observation : observations) {
+          for (DhtObservation observation : events) {
             if (fresh.contains(observation.infoHash())) {
               bindObservationFact(statement, "dht.resource_discovered", observation,
                   null, resourceObservationJson(observation));
@@ -569,7 +575,7 @@ final class Catalog implements AutoCloseable {
     return result;
   }
 
-  List<Map<String,Object>> recentProbes(int limit) throws SQLException { List<Map<String,Object>> result=new ArrayList<>(); try(Connection c=dataSource.getConnection();PreparedStatement p=c.prepareStatement("SELECT event_id,event_type,occurred_at,info_hash,peer_host,peer_port,source_host,source_port,mode,message FROM probe_event ORDER BY occurred_at DESC LIMIT ?")){p.setInt(1,limit);try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> row=new LinkedHashMap<>(); row.put("event_id",r.getString(1));row.put("event_type",r.getString(2));row.put("occurred_at",r.getTimestamp(3).toInstant().toString());row.put("info_hash",r.getString(4));row.put("peer_host",r.getString(5));row.put("peer_port",r.getObject(6));row.put("source_host",r.getString(7));row.put("source_port",r.getObject(8));row.put("mode",r.getString(9));row.put("message",r.getString(10));result.add(row);}}}return result; }
+  List<Map<String,Object>> recentProbes(int limit) throws SQLException { List<Map<String,Object>> result=new ArrayList<>(); try(Connection c=dataSource.getConnection();PreparedStatement p=c.prepareStatement("SELECT event_id,event_type,occurred_at,info_hash,peer_host,peer_port,source_host,source_port,mode,message FROM probe_event ORDER BY occurred_at DESC LIMIT ?")){p.setQueryTimeout(3);p.setInt(1,limit);try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> row=new LinkedHashMap<>(); row.put("event_id",r.getString(1));row.put("event_type",r.getString(2));row.put("occurred_at",r.getTimestamp(3).toInstant().toString());row.put("info_hash",r.getString(4));row.put("peer_host",r.getString(5));row.put("peer_port",r.getObject(6));row.put("source_host",r.getString(7));row.put("source_port",r.getObject(8));row.put("mode",r.getString(9));row.put("message",r.getString(10));result.add(row);}}}return result; }
   List<Map<String,Object>> contentPage(int limit,int offset) throws SQLException { return contentQuery("SELECT content_id,info_hash,variant,name,total_size,file_count,created_at,updated_at FROM content WHERE policy_state='approved' ORDER BY updated_at DESC,content_id DESC LIMIT ? OFFSET ?",limit,offset,null); }
   List<Map<String,Object>> searchPage(String query,int limit,int offset) throws SQLException {
     String term=validatedSearch(query);
@@ -580,8 +586,9 @@ final class Catalog implements AutoCloseable {
   static String validatedSearch(String query) { String trimmed=query==null?"":query.trim(); int length=trimmed.codePointCount(0,trimmed.length()); if(length<3||length>100) throw new IllegalArgumentException("search query must contain 3 to 100 characters"); return trimmed; }
   private long counter(String name) throws SQLException { try(Connection c=dataSource.getConnection();PreparedStatement p=c.prepareStatement("SELECT value FROM catalog_counter WHERE name=?")){p.setString(1,name);try(ResultSet r=p.executeQuery()){return r.next()?r.getLong(1):0;}} }
   long counterValue(String name) throws SQLException { return counter(name); }
+  boolean databaseAvailable() { try (Connection c = dataSource.getConnection(); Statement p = c.createStatement()) { p.setQueryTimeout(2); p.execute("SELECT 1"); return true; } catch (SQLException error) { return false; } }
   Connection connection() throws SQLException { return dataSource.getConnection(); }
-  List<Map<String,Object>> trend(int minutes) throws SQLException { List<Map<String,Object>> result=new ArrayList<>(); try(Connection c=dataSource.getConnection();PreparedStatement p=c.prepareStatement("WITH bounds AS (SELECT date_trunc('minute',now())-interval '1 minute' AS last_complete_bucket), buckets AS (SELECT generate_series(last_complete_bucket-(?::integer-1)*interval '1 minute',last_complete_bucket,interval '1 minute') AS bucket FROM bounds) SELECT b.bucket,coalesce(m.links,0),coalesce(m.queries,0),coalesce(m.failures,0),coalesce(m.warnings,0),coalesce(m.indexed,0) FROM buckets b LEFT JOIN minute_metric m USING(bucket) ORDER BY b.bucket")){p.setInt(1,minutes);try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> row=new LinkedHashMap<>();row.put("at",r.getTimestamp(1).toInstant().toString());row.put("links",r.getLong(2));row.put("queries",r.getLong(3));row.put("failures",r.getLong(4));row.put("warnings",r.getLong(5));row.put("indexed",r.getLong(6));result.add(row);}}}return result; }
+  List<Map<String,Object>> trend(int minutes) throws SQLException { List<Map<String,Object>> result=new ArrayList<>(); try(Connection c=dataSource.getConnection();PreparedStatement p=c.prepareStatement("WITH bounds AS (SELECT date_trunc('minute',now())-interval '1 minute' AS last_complete_bucket), buckets AS (SELECT generate_series(last_complete_bucket-(?::integer-1)*interval '1 minute',last_complete_bucket,interval '1 minute') AS bucket FROM bounds) SELECT b.bucket,coalesce(m.links,0),coalesce(m.queries,0),coalesce(m.failures,0),coalesce(m.warnings,0),coalesce(m.indexed,0) FROM buckets b LEFT JOIN minute_metric m USING(bucket) ORDER BY b.bucket")){p.setQueryTimeout(3);p.setInt(1,minutes);try(ResultSet r=p.executeQuery()){while(r.next()){Map<String,Object> row=new LinkedHashMap<>();row.put("at",r.getTimestamp(1).toInstant().toString());row.put("links",r.getLong(2));row.put("queries",r.getLong(3));row.put("failures",r.getLong(4));row.put("warnings",r.getLong(5));row.put("indexed",r.getLong(6));result.add(row);}}}return result; }
   @Override public void close(){
     try { flushCounters(); }
     catch (SQLException error) { System.err.println("catalog counter flush failed: " + error.getMessage()); }
