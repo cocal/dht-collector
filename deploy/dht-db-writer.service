@@ -1,0 +1,22 @@
+[Unit]
+Description=Distributed DHT observation database writer
+After=network-online.target keydb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/vibe/dht-collector
+EnvironmentFile=/root/.config/dht-search/db.env
+EnvironmentFile=-/etc/dht-search/monitor-redis.env
+Environment=DHT_NODE_ID=db-writer-%H
+ExecStart=/usr/bin/java -Xms64m -Xmx384m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -jar /opt/dht-collector/dht-collector-java.jar --mode db-writer --pool-size 1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryHigh=450M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

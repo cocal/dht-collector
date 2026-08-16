@@ -61,6 +61,9 @@ final class DhtCollector implements AutoCloseable {
   private final DhtObservationQueue observationQueue;
   private final MetadataFetcher metadata;
   private final JedisPooled redis;
+  private final RedisWorkQueue workQueue;
+  private final ObservationSpool observationSpool;
+  private final String taskConsumer;
   private final Map<String, Instant> pendingTouches = new ConcurrentHashMap<>();
   private final Map<String, Map<InetSocketAddress, PeerHint>> announcedPeers = new ConcurrentHashMap<>();
   private final Map<String, Boolean> runningMetadata = new ConcurrentHashMap<>();
@@ -70,6 +73,7 @@ final class DhtCollector implements AutoCloseable {
   private final AtomicLong peerSequence = new AtomicLong();
   private final AtomicLong discovered;
   private volatile Thread observationWriter;
+  private volatile Thread metadataQueueReader;
   private volatile boolean stopping;
 
   DhtCollector(Config config, Catalog catalog) throws Exception {
@@ -78,6 +82,9 @@ final class DhtCollector implements AutoCloseable {
     this.cache = new RecentResourceCache(CACHE_TTL_MS);
     this.monitor = new MonitorLogger();
     this.redis = connectRedis(config.redisUrl());
+    this.workQueue = redis == null ? null : new RedisWorkQueue(redis);
+    this.taskConsumer = System.getenv().getOrDefault("DHT_NODE_ID",
+        "collector-" + config.port() + "-" + ProcessHandle.current().pid());
     try {
       catalog.loadRecentResources(Instant.now().minus(Duration.ofHours(24)), cache::load);
       this.discovered = new AtomicLong(
@@ -90,6 +97,12 @@ final class DhtCollector implements AutoCloseable {
     this.observationQueue = new DhtObservationQueue(Math.max(2_048, config.maxConcurrent() * 64));
     this.metadataPermits = new Semaphore(config.metadataConcurrent());
     Files.createDirectories(config.storagePath());
+    try {
+      this.observationSpool = redis == null ? null : new ObservationSpool(config.storagePath().resolve("observation-spool.db"));
+    } catch (Exception error) {
+      if (redis != null) redis.close();
+      throw error;
+    }
     try {
       for (int index = 0; index < config.dhtNodes(); index++) {
         int port = config.port() + index;
@@ -115,6 +128,10 @@ final class DhtCollector implements AutoCloseable {
     if (observationWriter == null) {
       observationWriter = Thread.ofVirtual().name("dht-observation-writer").start(this::drainObservations);
     }
+    if (workQueue != null && metadataQueueReader == null) {
+      workQueue.ensureTaskGroup();
+      metadataQueueReader = Thread.ofVirtual().name("dht-metadata-queue-reader").start(this::consumeMetadataTasks);
+    }
     scheduler.scheduleWithFixedDelay(() -> {
       try {
         flushTouches();
@@ -133,13 +150,15 @@ final class DhtCollector implements AutoCloseable {
         System.err.println("catalog counter flush failed: " + error.getMessage());
       }
     }, 5, 5, TimeUnit.SECONDS);
-    scheduler.scheduleWithFixedDelay(() -> {
-      try { pollMetadataJobs(); }
-      catch (Exception error) {
-        monitor.metric("collector.failed", 1);
-        System.err.println("metadata job poll failed: " + error.getMessage());
-      }
-    }, 5, 5, TimeUnit.SECONDS);
+    if (workQueue == null) {
+      scheduler.scheduleWithFixedDelay(() -> {
+        try { pollMetadataJobs(); }
+        catch (Exception error) {
+          monitor.metric("collector.failed", 1);
+          System.err.println("metadata job poll failed: " + error.getMessage());
+        }
+      }, 5, 5, TimeUnit.SECONDS);
+    }
     scheduler.scheduleWithFixedDelay(() -> {
       long routingNodes = nodes.stream().mapToLong(node -> node.getNode().getNumEntriesInRoutingTable()).sum();
       if (routingNodes > 0) monitor.metric("dht.routing_nodes", routingNodes);
@@ -210,6 +229,10 @@ final class DhtCollector implements AutoCloseable {
 
   private void enqueueObservation(DhtObservation observation) {
     long observedAt = observation.observedAt().toEpochMilli();
+    if (workQueue != null) {
+      observationQueue.offer(observation);
+      return;
+    }
     if (cache.contains(observation.infoHash(), observedAt)) {
       cache.observe(observation.infoHash(), observedAt);
       if (!observation.isAnnounce()) {
@@ -233,6 +256,15 @@ final class DhtCollector implements AutoCloseable {
       }
       if (batch.isEmpty()) continue;
       try {
+        if (workQueue != null) {
+          publishQueuedObservations(batch);
+          long queuedAt = System.currentTimeMillis();
+          for (DhtObservation observation : batch) {
+            cache.observe(observation.infoHash(), Math.max(queuedAt, observation.observedAt().toEpochMilli()));
+          }
+          monitor.metric("collector.observation_enqueued", batch.size());
+          continue;
+        }
         Catalog.ObservationWrite write = catalog.persistObservations(batch);
         long persistedAt = System.currentTimeMillis();
         for (DhtObservation observation : batch) {
@@ -262,7 +294,34 @@ final class DhtCollector implements AutoCloseable {
     }
   }
 
+  private void publishQueuedObservations(List<DhtObservation> batch) throws Exception {
+    if (observationSpool != null && workQueue.observationDepth() < 50_000) {
+      List<DhtObservation> replay = observationSpool.read(Math.min(OBSERVATION_BATCH_SIZE, batch.size()));
+      if (!replay.isEmpty()) {
+        try {
+          for (DhtObservation observation : replay) workQueue.publishObservation(observation);
+          observationSpool.remove(replay);
+        } catch (RuntimeException error) {
+          observationSpool.append(batch);
+          return;
+        }
+      }
+    }
+    if (workQueue.observationDepth() >= 100_000) {
+      observationSpool.append(batch);
+      monitor.metric("collector.observation_spooled", batch.size());
+      return;
+    }
+    try {
+      for (DhtObservation observation : batch) workQueue.publishObservation(observation);
+    } catch (RuntimeException error) {
+      observationSpool.append(batch);
+      monitor.metric("collector.observation_spooled", batch.size());
+    }
+  }
+
   private void flushTouches() throws Exception {
+    if (workQueue != null) return;
     if (pendingTouches.isEmpty()) return;
     Map<String, Instant> copy = new HashMap<>(pendingTouches);
     catalog.touch(copy);
@@ -280,6 +339,68 @@ final class DhtCollector implements AutoCloseable {
       return;
     }
     pendingTouches.putIfAbsent(infoHash, observedAt);
+  }
+
+  private void consumeMetadataTasks() {
+    while (!stopping) {
+      int capacity = metadataPermits.availablePermits();
+      if (capacity < 1) {
+        try { Thread.sleep(250); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+        continue;
+      }
+      try {
+        List<RedisWorkQueue.Task> tasks = workQueue.readTasks(taskConsumer, Math.min(16, capacity));
+        if (tasks.isEmpty()) continue;
+        for (RedisWorkQueue.Task task : tasks) {
+          if (!metadataPermits.tryAcquire()) break;
+          launchQueuedMetadataTask(task);
+        }
+      } catch (Exception error) {
+        monitor.metric("collector.failed", 1);
+        System.err.println("metadata stream poll failed: " + error.getMessage());
+        try { Thread.sleep(1_000); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+      }
+    }
+  }
+
+  private void launchQueuedMetadataTask(RedisWorkQueue.Task task) {
+    String infoHash = task.infoHash();
+    TaskLease lease = TaskLease.tryAcquire(redis, infoHash);
+    if (lease == null || runningMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) {
+      if (lease != null) lease.close();
+      metadataPermits.release();
+      return;
+    }
+    tasks.submit(() -> {
+      boolean acknowledge = false;
+      try {
+        if (!catalog.claimImmediateMetadataJob(infoHash, Instant.now())) {
+          acknowledge = true;
+          return;
+        }
+        Map<String, List<InetSocketAddress>> persisted = catalog.recentPeerHints(
+            List.of(infoHash), Instant.now().minusMillis(ANNOUNCE_PEER_TTL_MS), 3);
+        Collection<InetSocketAddress> peers = mergePeerHints(currentAnnouncePeers(infoHash), persisted.get(infoHash));
+        int timeoutSeconds = task.priority() >= LIVE_METADATA_PRIORITY
+            ? liveDirectTimeoutSeconds() : liveMetadataTimeoutSeconds();
+        var result = task.priority() >= LIVE_METADATA_PRIORITY
+            ? metadata.fetchDirect(infoHash, peers, timeoutSeconds).toCompletableFuture()
+            : metadata.fetch(infoHash, peers, timeoutSeconds).toCompletableFuture();
+        var manifest = result.get(timeoutSeconds + 5L, TimeUnit.SECONDS);
+        acknowledge = manifest.isPresent()
+            ? completeMetadataSuccess(infoHash, manifest.get())
+            : completeMetadataFailure(infoHash, "no metadata result");
+      } catch (Exception error) {
+        acknowledge = completeMetadataFailure(infoHash, error.getMessage());
+      } finally {
+        if (acknowledge) workQueue.ackTask(task);
+        lease.close();
+        runningMetadata.remove(infoHash);
+        metadataPermits.release();
+      }
+    });
   }
 
   private void pollMetadataJobs() throws Exception {
@@ -529,7 +650,7 @@ final class DhtCollector implements AutoCloseable {
     return List.of(advertised, new InetSocketAddress(origin.getAddress(), origin.getPort()));
   }
 
-  private void completeMetadataSuccess(String infoHash, Manifest manifest) {
+  private boolean completeMetadataSuccess(String infoHash, Manifest manifest) {
     try {
       Catalog.ManifestWrite write = catalog.upsertManifest(manifest);
       monitor.metric("metadata.fetch_completed", 1);
@@ -539,31 +660,36 @@ final class DhtCollector implements AutoCloseable {
               + write.inserted() + "}", "passive");
       if (write.inserted()) monitor.metric("content.indexed", 1);
       catalog.completeMetadataJob(infoHash, true, Instant.now());
+      return true;
     } catch (Exception error) {
       monitor.metric("collector.failed", 1);
       System.err.println("metadata persistence failed: " + error.getMessage());
+      return false;
     }
   }
 
-  private void completeDirectMetadataSuccess(String infoHash, Manifest manifest) {
+  private boolean completeDirectMetadataSuccess(String infoHash, Manifest manifest) {
     monitor.metric("metadata.direct_completed", 1);
-    completeMetadataSuccess(infoHash, manifest);
+    return completeMetadataSuccess(infoHash, manifest);
   }
 
-  private void completeMetadataFailure(String infoHash, String message) {
+  private boolean completeMetadataFailure(String infoHash, String message) {
     try {
       monitor.metric("metadata.fetch_failed", 1);
       catalog.event("metadata.fetch_failed", infoHash,
           "{\"event\":\"metadata.fetch_failed\",\"info_hash\":\"" + infoHash
               + "\",\"message\":\"" + jsonEscape(message == null ? "unknown" : message) + "\"}", "passive");
-      catalog.completeMetadataJob(infoHash, false, Instant.now());
+      boolean dead = catalog.completeMetadataJob(infoHash, false, Instant.now(), message);
+      if (dead && workQueue != null) workQueue.publishDeadTask(infoHash, message);
+      return true;
     } catch (Exception error) {
       monitor.metric("collector.failed", 1);
       System.err.println("metadata failure persistence failed: " + error.getMessage());
+      return false;
     }
   }
 
-  private void completeDirectMetadataMiss(String infoHash, String message) {
+  private boolean completeDirectMetadataMiss(String infoHash, String message) {
     try {
       catalog.queueMetadataJob(infoHash, Instant.now().plusSeconds(DIRECT_FALLBACK_DELAY_SECONDS),
           DIRECT_FALLBACK_PRIORITY, true);
@@ -571,9 +697,11 @@ final class DhtCollector implements AutoCloseable {
       catalog.event("metadata.direct_miss", infoHash,
           "{\"event\":\"metadata.direct_miss\",\"info_hash\":\"" + infoHash
               + "\",\"message\":\"" + jsonEscape(message == null ? "unknown" : message) + "\"}", "passive");
+      return true;
     } catch (Exception error) {
       monitor.metric("collector.failed", 1);
       System.err.println("direct metadata retry persistence failed: " + error.getMessage());
+      return false;
     }
   }
 
@@ -599,9 +727,11 @@ final class DhtCollector implements AutoCloseable {
       long count = entry.getValue().sumThenReset();
       if (count > 0) {
         monitor.metric("dht.query_summary", count, entry.getKey());
-        catalog.event("dht.query_summary", null,
-            "{\"event\":\"dht.query_summary\",\"query\":\"" + entry.getKey()
-                + "\",\"occurrences\":" + count + ",\"interval_seconds\":30}");
+        if (workQueue == null) {
+          catalog.event("dht.query_summary", null,
+              "{\"event\":\"dht.query_summary\",\"query\":\"" + entry.getKey()
+                  + "\",\"occurrences\":" + count + ",\"interval_seconds\":30}");
+        }
       }
     }
   }
@@ -618,6 +748,12 @@ final class DhtCollector implements AutoCloseable {
       catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
       if (writer.isAlive()) writer.interrupt();
     }
+    Thread taskReader = metadataQueueReader;
+    if (taskReader != null) {
+      taskReader.interrupt();
+      try { taskReader.join(2_000); }
+      catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+    }
     metadata.close();
     tasks.close();
     try {
@@ -627,6 +763,7 @@ final class DhtCollector implements AutoCloseable {
       System.err.println("final catalog flush failed: " + error.getMessage());
     }
     monitor.close();
+    if (observationSpool != null) observationSpool.close();
     if (redis != null) redis.close();
   }
 }

@@ -243,8 +243,27 @@ dht-remote-monitor-redis-bridge.service
 KeyDB（`10.78.0.166:6379`），不依赖 SSH 反向隧道。collector 使用独立的
 `dht-remote-104` 数据库 ApplicationName 和节点 ID，便于观察连接与节点统计。
 
-任务分发不依赖 Redis：所有 collector 连接同一个 `metadata_job` 表，使用
-`FOR UPDATE SKIP LOCKED` 原子认领任务。这样多个节点可以并行处理同一队列，
-同一个 info-hash 不会被两个 worker 同时执行。当前远端连接池限制为 1，原因是
-现有 PostgreSQL 角色连接额度较小；扩容前应先提高数据库角色连接上限并重新规划
-各服务 pool size。
+### 队列化写入和任务分发
+
+生产环境使用 Redis Stream 把采集和 PostgreSQL 写入解耦：
+
+```text
+DHT collector(s) -> dht:observations -> dht-db-writers -> PostgreSQL
+                                      |
+                                      -> dht:metadata-tasks -> metadata workers
+                                      -> dht:metadata-dead
+```
+
+`dht-db-writer.service` 是唯一的观测数据库写入者。它使用 Consumer Group
+`dht-db-writers`，提交 `discovered_resource`、`metadata_job`、`probe_event` 后才
+ACK；崩溃时由 `XAUTOCLAIM` 重新接管。采集器只在 Redis Stream 中保留短消息，
+Redis 不可用或队列积压时写入本机 SQLite `observation-spool.db`，恢复后补投。
+
+元数据任务使用 Consumer Group `dht-metadata-workers`，Redis 锁只作为短租约，
+`metadata_job` 的 `status/attempts/locked_until/last_error` 是最终状态。失败超过
+8 次进入 `dead`，并同时写入 `dht:metadata-dead`，不会无限重试。
+
+远端节点也只入队，不直接写 PostgreSQL；这样跨节点不会对相同 info-hash 产生
+并发 upsert。Dashboard 只读 Redis 聚合和受限的 PostgreSQL 查询，不在采集写事务
+上共享连接。当前远端连接池限制为 1，原因是现有 PostgreSQL 角色连接额度较小；
+扩容前应先提高数据库角色连接上限并重新规划各服务 pool size。

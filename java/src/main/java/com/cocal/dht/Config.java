@@ -38,8 +38,8 @@ record Config(String mode, String address, int port, int dhtNodes, int maxConcur
       else if (argument.equals("--redis-url")) redisUrl = args[++index];
       else throw new IllegalArgumentException("unknown option: " + argument);
     }
-    if (!mode.equals("collector") && !mode.equals("dashboard") && !Cli.supports(mode)) throw new IllegalArgumentException("unknown --mode: " + mode);
-    if ((mode.equals("collector") || mode.equals("dashboard")) && (url == null || url.isBlank())) throw new IllegalArgumentException("DATABASE_URL or --db-url is required");
+    if (!mode.equals("collector") && !mode.equals("dashboard") && !mode.equals("db-writer") && !Cli.supports(mode)) throw new IllegalArgumentException("unknown --mode: " + mode);
+    if ((mode.equals("collector") || mode.equals("dashboard") || mode.equals("db-writer")) && (url == null || url.isBlank())) throw new IllegalArgumentException("DATABASE_URL or --db-url is required");
     if (port < 1 || port + nodes - 1 > 65535) throw new IllegalArgumentException("invalid DHT port range");
     if (max < 0) throw new IllegalArgumentException("--max-resources must not be negative");
     if (nodes < 1 || concurrent < 1 || pool < 1 || httpPort < 1 || httpPort > 65535 || metadataConcurrent < 1 || metadataTimeout < 1) throw new IllegalArgumentException("node, concurrency, pool, HTTP and timeout sizes must be positive");

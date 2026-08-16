@@ -8,15 +8,20 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-record DhtObservation(String infoHash, Instant observedAt, String query,
+record DhtObservation(String eventId, String infoHash, Instant observedAt, String query,
                       InetSocketAddress peer, InetSocketAddress source) {
+  DhtObservation(String infoHash, Instant observedAt, String query,
+                 InetSocketAddress peer, InetSocketAddress source) {
+    this(java.util.UUID.randomUUID().toString(), infoHash, observedAt, query, peer, source);
+  }
+
   boolean isAnnounce() { return "announce_peer".equals(query); }
 
   DhtObservation merge(DhtObservation newer) {
     if (!infoHash.equals(newer.infoHash)) throw new IllegalArgumentException("cannot merge different info-hashes");
     if (newer.isAnnounce()) return newer;
     if (isAnnounce()) {
-      return new DhtObservation(infoHash, newer.observedAt.isAfter(observedAt) ? newer.observedAt : observedAt,
+      return new DhtObservation(newer.eventId, infoHash, newer.observedAt.isAfter(observedAt) ? newer.observedAt : observedAt,
           query, peer, source);
     }
     return newer.observedAt.isAfter(observedAt) ? newer : this;

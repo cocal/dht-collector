@@ -141,12 +141,18 @@ The Java service uses the existing PostgreSQL catalog, including
 `discovered_resource`, `probe_event`, `metadata_job`, `content`, and
 `file_entry`. It keeps only resources seen in the last 24 hours resident,
 claims metadata retries from the database, verifies the BEP 9 info dictionary,
-and writes searchable content. Incoming DHT observations are coalesced by
-info-hash in a bounded priority queue; fresh `announce_peer` observations are
-kept ahead of `get_peers` traffic and persisted in batches of up to 256 using
-one database transaction. Generic unit templates are in
+and writes searchable content. With `REDIS_URL` configured, collectors publish
+observations to `dht:observations`; `--mode db-writer` consumes that stream and is
+the only PostgreSQL observation writer. Metadata tasks use the
+`dht:metadata-tasks` consumer group, with retry state in `metadata_job` and a
+`dht:metadata-dead` stream after eight failures. If Redis is unavailable,
+observations are buffered in the node's SQLite spool and replayed later.
+Incoming DHT observations are still coalesced by info-hash in a bounded priority
+queue; fresh `announce_peer` observations are kept ahead of `get_peers` traffic.
+Generic unit templates are in
 `deploy/dht-passive-collector-java.service` and
-`deploy/dht-search-dashboard-java.service`; adjust paths and the private
+`deploy/dht-search-dashboard-java.service` and
+`deploy/dht-db-writer.service`; adjust paths and the private
 environment-file location for the target host. The environment file must stay
 outside the repository.
 

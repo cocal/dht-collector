@@ -29,6 +29,7 @@ import java.util.function.BiConsumer;
 
 final class Catalog implements AutoCloseable {
   private static final int TOUCH_BATCH_SIZE = 1_000;
+  private static final String METADATA_JOB_LOCK = "SELECT pg_advisory_xact_lock(hashtextextended('dht-metadata-job-state', 0))";
   private static final String CONTENT_SEARCH_HEAD = "to_tsvector('simple', left(coalesce(c.name,'') || ' ' || coalesce(c.files_text,''), 800000))";
   private static final String CONTENT_SEARCH_TAIL = "to_tsvector('simple', substring(coalesce(c.files_text,'') from 700001 for 800000))";
   private static final String CONTENT_SEARCH_MATCH = "(" + CONTENT_SEARCH_HEAD + " @@ s.term OR (length(c.files_text) > 700000 AND " + CONTENT_SEARCH_TAIL + " @@ s.term))";
@@ -56,6 +57,7 @@ final class Catalog implements AutoCloseable {
     config.setKeepaliveTime(Duration.ofMinutes(1).toMillis());
     config.setMaxLifetime(Duration.ofMinutes(10).toMillis());
     config.addDataSourceProperty("tcpKeepAlive", "true");
+    config.addDataSourceProperty("reWriteBatchedInserts", "true");
     dataSource = new HikariDataSource(config);
   }
 
@@ -93,7 +95,12 @@ final class Catalog implements AutoCloseable {
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS probe_event (event_id text PRIMARY KEY, event_type text NOT NULL, occurred_at timestamptz NOT NULL, info_hash text, peer_host text, peer_port integer, source_host text, source_port integer, mode text, message text, raw_event jsonb NOT NULL)");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_occurred_at_idx ON probe_event (occurred_at DESC)");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_info_hash_idx ON probe_event (info_hash, occurred_at DESC)");
-        statement.executeUpdate("CREATE TABLE IF NOT EXISTS metadata_job (info_hash text PRIMARY KEY, priority integer NOT NULL DEFAULT 0, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)");
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS metadata_job (info_hash text PRIMARY KEY, priority integer NOT NULL DEFAULT 0, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, status text NOT NULL DEFAULT 'pending', locked_by text, locked_until timestamptz, last_error text)");
+        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'pending'");
+        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS locked_by text");
+        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS locked_until timestamptz");
+        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS last_error text");
+        statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_status_due_idx ON metadata_job (status, priority DESC, next_attempt_at ASC, updated_at DESC)");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_due_idx ON metadata_job (priority DESC, next_attempt_at ASC, updated_at DESC)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS catalog_counter (name text PRIMARY KEY, value bigint NOT NULL DEFAULT 0)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS minute_metric (bucket timestamptz PRIMARY KEY, links bigint NOT NULL DEFAULT 0, queries bigint NOT NULL DEFAULT 0, failures bigint NOT NULL DEFAULT 0, warnings bigint NOT NULL DEFAULT 0, indexed bigint NOT NULL DEFAULT 0)");
@@ -176,6 +183,7 @@ final class Catalog implements AutoCloseable {
     int factCount = 0;
     try (Connection connection = dataSource.getConnection()) {
       connection.setAutoCommit(false);
+      lockMetadataJobs(connection);
       try {
         int[] inserted;
         try (PreparedStatement statement = connection.prepareStatement(
@@ -212,7 +220,7 @@ final class Catalog implements AutoCloseable {
                 + "SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) "
                 + "ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,excluded.priority),"
                 + "next_attempt_at=CASE WHEN ? THEN least(metadata_job.next_attempt_at,excluded.next_attempt_at) "
-                + "ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at")) {
+                + "ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at,status=CASE WHEN excluded.priority>=100 AND metadata_job.status='dead' THEN 'pending' ELSE metadata_job.status END,last_error=NULL")) {
           for (DhtObservation observation : resources) {
             int priority = observation.isAnnounce() ? 100 : 10;
             Timestamp at = Timestamp.from(observation.observedAt());
@@ -241,13 +249,13 @@ final class Catalog implements AutoCloseable {
           for (DhtObservation observation : events) {
             if (fresh.contains(observation.infoHash())) {
               bindObservationFact(statement, "dht.resource_discovered", observation,
-                  null, resourceObservationJson(observation));
+                  null, resourceObservationJson(observation), observation.eventId() + ":resource");
               statement.addBatch();
               factCount++;
             }
             if (observation.isAnnounce() && observation.peer() != null) {
               bindObservationFact(statement, "dht.peer_discovered", observation,
-                  observation.peer(), peerObservationJson(observation));
+                  observation.peer(), peerObservationJson(observation), observation.eventId() + ":peer");
               statement.addBatch();
               factCount++;
               peerFacts++;
@@ -275,9 +283,9 @@ final class Catalog implements AutoCloseable {
 
   private static void bindObservationFact(PreparedStatement statement, String type,
                                           DhtObservation observation, InetSocketAddress peer,
-                                          String rawJson) throws SQLException {
+                                          String rawJson, String eventId) throws SQLException {
     InetSocketAddress source = observation.source();
-    statement.setString(1, UUID.randomUUID().toString());
+    statement.setString(1, eventId);
     statement.setString(2, type);
     statement.setTimestamp(3, Timestamp.from(observation.observedAt()));
     statement.setString(4, observation.infoHash());
@@ -452,16 +460,41 @@ final class Catalog implements AutoCloseable {
   }
 
   boolean queueMetadataJob(String hash, Instant at, int priority, boolean accelerate) throws SQLException {
-    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at) SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,excluded.priority),next_attempt_at=CASE WHEN ? THEN least(metadata_job.next_attempt_at,excluded.next_attempt_at) ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at")) {
-      statement.setString(1, hash); statement.setInt(2, priority); statement.setInt(3, 0); statement.setTimestamp(4, Timestamp.from(at)); statement.setTimestamp(5, Timestamp.from(at)); statement.setString(6, hash); statement.setBoolean(7, accelerate); return statement.executeUpdate() > 0;
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at,status) SELECT ?,?,?,?,?,'pending' WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,excluded.priority),next_attempt_at=CASE WHEN ? THEN least(metadata_job.next_attempt_at,excluded.next_attempt_at) ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at,status=CASE WHEN metadata_job.status='processing' THEN metadata_job.status ELSE 'pending' END,last_error=NULL")) {
+      connection.setAutoCommit(false);
+      lockMetadataJobs(connection);
+      statement.setString(1, hash); statement.setInt(2, priority); statement.setInt(3, 0); statement.setTimestamp(4, Timestamp.from(at)); statement.setTimestamp(5, Timestamp.from(at)); statement.setString(6, hash); statement.setBoolean(7, accelerate); boolean changed = statement.executeUpdate() > 0; connection.commit(); return changed;
     }
   }
 
-  boolean claimImmediateMetadataJob(String hash, Instant at) throws SQLException {
-    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("UPDATE metadata_job j SET attempts=j.attempts+1,priority=0,next_attempt_at=?::timestamptz + interval '10 minutes',updated_at=?::timestamptz WHERE j.info_hash=? AND j.next_attempt_at <= ?::timestamptz AND NOT EXISTS (SELECT 1 FROM content c WHERE c.info_hash=j.info_hash) RETURNING j.info_hash")) {
+  /** Return due jobs without claiming them; the Redis task stream performs the claim. */
+  List<Map.Entry<String, Integer>> dueMetadataJobs(int limit, Instant at) throws SQLException {
+    List<Map.Entry<String, Integer>> result = new ArrayList<>();
+    String sql = "SELECT j.info_hash,j.priority FROM metadata_job j "
+        + "WHERE j.status='pending' AND j.next_attempt_at <= ? AND EXISTS (SELECT 1 FROM discovered_resource r "
+        + "WHERE r.info_hash=j.info_hash AND r.state='active' AND r.last_seen_at >= ?) "
+        + "AND NOT EXISTS (SELECT 1 FROM content c WHERE c.info_hash=j.info_hash) "
+        + "ORDER BY j.priority DESC,j.updated_at DESC,j.next_attempt_at ASC LIMIT ?";
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement(sql)) {
+      statement.setQueryTimeout(3);
       Timestamp timestamp = Timestamp.from(at);
-      statement.setTimestamp(1, timestamp); statement.setTimestamp(2, timestamp); statement.setString(3, hash); statement.setTimestamp(4, timestamp);
-      try (ResultSet rows = statement.executeQuery()) { return rows.next(); }
+      statement.setTimestamp(1, timestamp);
+      statement.setTimestamp(2, Timestamp.from(at.minus(java.time.Duration.ofHours(24))));
+      statement.setInt(3, limit);
+      try (ResultSet rows = statement.executeQuery()) {
+        while (rows.next()) result.add(Map.entry(rows.getString(1), rows.getInt(2)));
+      }
+    }
+    return result;
+  }
+
+  boolean claimImmediateMetadataJob(String hash, Instant at) throws SQLException {
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("UPDATE metadata_job j SET attempts=j.attempts+1,priority=0,next_attempt_at=?::timestamptz + interval '90 seconds',updated_at=?::timestamptz,status='processing',locked_by=current_setting('application_name',true),locked_until=?::timestamptz + interval '90 seconds',last_error=NULL WHERE j.info_hash=? AND (j.status='pending' OR (j.status='processing' AND j.locked_until <= ?::timestamptz)) AND j.next_attempt_at <= ?::timestamptz AND NOT EXISTS (SELECT 1 FROM content c WHERE c.info_hash=j.info_hash) RETURNING j.info_hash")) {
+      connection.setAutoCommit(false);
+      lockMetadataJobs(connection);
+      Timestamp timestamp = Timestamp.from(at);
+      statement.setTimestamp(1, timestamp); statement.setTimestamp(2, timestamp); statement.setTimestamp(3, timestamp); statement.setString(4, hash); statement.setTimestamp(5, timestamp); statement.setTimestamp(6, timestamp);
+      try (ResultSet rows = statement.executeQuery()) { boolean claimed = rows.next(); connection.commit(); return claimed; }
     }
   }
 
@@ -475,9 +508,12 @@ final class Catalog implements AutoCloseable {
 
   List<String> claimMetadataJobs(int limit, Instant at, int minimumPriority, int maximumPriority) throws SQLException {
     List<String> result = new ArrayList<>();
-    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("WITH due AS (SELECT j.info_hash FROM metadata_job j WHERE j.next_attempt_at <= ?::timestamptz AND j.priority >= ? AND j.priority < ? AND EXISTS (SELECT 1 FROM discovered_resource r WHERE r.info_hash=j.info_hash AND r.state='active' AND r.last_seen_at >= ?::timestamptz) AND NOT EXISTS (SELECT 1 FROM content c WHERE c.info_hash=j.info_hash) ORDER BY j.priority DESC,j.updated_at DESC,j.next_attempt_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT ?) UPDATE metadata_job j SET attempts=j.attempts+1,priority=0,next_attempt_at=?::timestamptz + interval '10 minutes',updated_at=?::timestamptz FROM due WHERE j.info_hash=due.info_hash RETURNING j.info_hash")) {
-      Timestamp timestamp = Timestamp.from(at); Timestamp recent = Timestamp.from(at.minus(java.time.Duration.ofHours(24))); statement.setTimestamp(1, timestamp); statement.setInt(2, minimumPriority); statement.setInt(3, maximumPriority); statement.setTimestamp(4, recent); statement.setInt(5, limit); statement.setTimestamp(6, timestamp); statement.setTimestamp(7, timestamp);
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("WITH due AS (SELECT j.info_hash FROM metadata_job j WHERE j.status='pending' AND j.next_attempt_at <= ?::timestamptz AND j.priority >= ? AND j.priority < ? AND EXISTS (SELECT 1 FROM discovered_resource r WHERE r.info_hash=j.info_hash AND r.state='active' AND r.last_seen_at >= ?::timestamptz) AND NOT EXISTS (SELECT 1 FROM content c WHERE c.info_hash=j.info_hash) ORDER BY j.priority DESC,j.updated_at DESC,j.next_attempt_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT ?) UPDATE metadata_job j SET attempts=j.attempts+1,priority=0,next_attempt_at=?::timestamptz + interval '90 seconds',updated_at=?::timestamptz,status='processing',locked_by=current_setting('application_name',true),locked_until=?::timestamptz + interval '90 seconds' FROM due WHERE j.info_hash=due.info_hash RETURNING j.info_hash")) {
+      connection.setAutoCommit(false);
+      lockMetadataJobs(connection);
+      Timestamp timestamp = Timestamp.from(at); Timestamp recent = Timestamp.from(at.minus(java.time.Duration.ofHours(24))); statement.setTimestamp(1, timestamp); statement.setInt(2, minimumPriority); statement.setInt(3, maximumPriority); statement.setTimestamp(4, recent); statement.setInt(5, limit); statement.setTimestamp(6, timestamp); statement.setTimestamp(7, timestamp); statement.setTimestamp(8, timestamp);
       try (ResultSet rows = statement.executeQuery()) { while (rows.next()) result.add(rows.getString(1)); }
+      connection.commit();
     }
     return result;
   }
@@ -525,12 +561,31 @@ final class Catalog implements AutoCloseable {
     if (!peers.contains(endpoint)) peers.add(endpoint);
   }
 
-  void completeMetadataJob(String hash, boolean succeeded, Instant at) throws SQLException {
+  boolean completeMetadataJob(String hash, boolean succeeded, Instant at) throws SQLException {
     if (succeeded) {
-      try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("DELETE FROM metadata_job WHERE info_hash=?")) { statement.setString(1, hash); statement.executeUpdate(); }
-      return;
+      try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("DELETE FROM metadata_job WHERE info_hash=?")) { connection.setAutoCommit(false); lockMetadataJobs(connection); statement.setString(1, hash); statement.executeUpdate(); connection.commit(); }
+      return false;
     }
-    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("UPDATE metadata_job SET next_attempt_at=CASE WHEN priority>=100 THEN least(next_attempt_at,?::timestamptz) ELSE ?::timestamptz + make_interval(hours => least(168,power(2,least(greatest(attempts-1,0),8))::integer)) END,updated_at=?::timestamptz WHERE info_hash=?")) { Timestamp timestamp = Timestamp.from(at); statement.setTimestamp(1, timestamp); statement.setTimestamp(2, timestamp); statement.setTimestamp(3, timestamp); statement.setString(4, hash); statement.executeUpdate(); }
+    return completeMetadataJob(hash, false, at, null);
+  }
+
+  boolean completeMetadataJob(String hash, boolean succeeded, Instant at, String errorMessage) throws SQLException {
+    if (succeeded) return completeMetadataJob(hash, true, at);
+    String sql = "UPDATE metadata_job SET next_attempt_at=CASE WHEN priority>=100 THEN least(next_attempt_at,?::timestamptz) ELSE ?::timestamptz + make_interval(hours => least(168,power(2,least(greatest(attempts-1,0),8))::integer)) END,updated_at=?::timestamptz,status=CASE WHEN attempts>=8 THEN 'dead' ELSE 'pending' END,locked_until=NULL,last_error=? WHERE info_hash=? RETURNING status='dead'";
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement(sql)) {
+      connection.setAutoCommit(false);
+      lockMetadataJobs(connection);
+      Timestamp timestamp = Timestamp.from(at);
+      statement.setTimestamp(1, timestamp); statement.setTimestamp(2, timestamp); statement.setTimestamp(3, timestamp);
+      String message = errorMessage == null ? "unknown" : errorMessage;
+      statement.setString(4, message.substring(0, Math.min(2_000, message.length())));
+      statement.setString(5, hash);
+      try (ResultSet rows = statement.executeQuery()) { boolean dead = rows.next() && rows.getBoolean(1); connection.commit(); return dead; }
+    }
+  }
+
+  private static void lockMetadataJobs(Connection connection) throws SQLException {
+    try (Statement statement = connection.createStatement()) { statement.execute(METADATA_JOB_LOCK); }
   }
 
   int markInvalidResources(Instant cutoff) throws SQLException {

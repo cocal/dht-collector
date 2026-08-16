@@ -1,18 +1,26 @@
 package com.cocal.dht;
+import redis.clients.jedis.JedisPooled;
 public final class Main {
   public static void main(String[] args) throws Exception {
     String requestedMode = modeArgument(args);
-    if (requestedMode != null && !requestedMode.equals("collector") && !requestedMode.equals("dashboard")) {
+    if (requestedMode != null && !requestedMode.equals("collector") && !requestedMode.equals("dashboard") && !requestedMode.equals("db-writer")) {
       Cli.run(args);
       return;
     }
     Config config = Config.from(args);
     try (Catalog catalog = new Catalog(config.dbUrl(), config.dbUser(), config.dbPassword(), config.poolSize())) {
-      catalog.initialize();
+      // Dashboard is read-only; schema migration belongs to the writer/collector startup path.
+      if (!config.mode().equals("dashboard")) catalog.initialize();
       if (config.mode().equals("dashboard")) {
         try (DashboardServer dashboard = new DashboardServer(catalog, config)) {
           dashboard.start();
           Thread.currentThread().join();
+        }
+      } else if (config.mode().equals("db-writer")) {
+        JedisPooled redis = connectRedis(config.redisUrl());
+        if (redis == null) throw new IllegalStateException("REDIS_URL is required for db-writer mode");
+        try (DbWriter writer = new DbWriter(catalog, redis)) {
+          writer.run();
         }
       } else {
         try (DhtCollector collector = new DhtCollector(config, catalog)) {
@@ -23,6 +31,12 @@ public final class Main {
         }
       }
     }
+  }
+
+  private static JedisPooled connectRedis(String url) {
+    if (url == null || url.isBlank()) return null;
+    try { JedisPooled client = new JedisPooled(java.net.URI.create(url)); client.ping(); return client; }
+    catch (RuntimeException error) { System.err.println("db writer Redis unavailable: " + error.getMessage()); return null; }
   }
 
   private static String modeArgument(String[] args) {
