@@ -29,6 +29,7 @@ import lbms.plugins.mldht.kad.DHT.DHTtype;
 import lbms.plugins.mldht.kad.messages.AnnounceRequest;
 import lbms.plugins.mldht.kad.messages.GetPeersRequest;
 import lbms.plugins.mldht.kad.messages.MessageBase;
+import redis.clients.jedis.JedisPooled;
 
 final class DhtCollector implements AutoCloseable {
   static final long CACHE_TTL_MS = Duration.ofHours(24).toMillis();
@@ -59,6 +60,7 @@ final class DhtCollector implements AutoCloseable {
   private final Semaphore metadataPermits;
   private final DhtObservationQueue observationQueue;
   private final MetadataFetcher metadata;
+  private final JedisPooled redis;
   private final Map<String, Instant> pendingTouches = new ConcurrentHashMap<>();
   private final Map<String, Map<InetSocketAddress, PeerHint>> announcedPeers = new ConcurrentHashMap<>();
   private final Map<String, Boolean> runningMetadata = new ConcurrentHashMap<>();
@@ -75,12 +77,14 @@ final class DhtCollector implements AutoCloseable {
     this.catalog = catalog;
     this.cache = new RecentResourceCache(CACHE_TTL_MS);
     this.monitor = new MonitorLogger();
+    this.redis = connectRedis(config.redisUrl());
     try {
       catalog.loadRecentResources(Instant.now().minus(Duration.ofHours(24)), cache::load);
       this.discovered = new AtomicLong(
           config.maxResources() > 0 ? catalog.countDiscoveredResources() : 0);
     } catch (Exception error) {
       monitor.close();
+      if (redis != null) redis.close();
       throw error;
     }
     this.observationQueue = new DhtObservationQueue(Math.max(2_048, config.maxConcurrent() * 64));
@@ -102,6 +106,7 @@ final class DhtCollector implements AutoCloseable {
       scheduler.shutdownNow();
       tasks.close();
       monitor.close();
+      if (redis != null) redis.close();
       throw error;
     }
   }
@@ -311,7 +316,14 @@ final class DhtCollector implements AutoCloseable {
       final Map<String, List<InetSocketAddress>> recoveredPeers = persistedPeers;
       for (String infoHash : claimed) {
         remaining--;
+        TaskLease lease = TaskLease.tryAcquire(redis, infoHash);
+        if (redis != null && lease == null) {
+          catalog.queueMetadataJob(infoHash, Instant.now().plusSeconds(5), minimumPriority, true);
+          metadataPermits.release();
+          continue;
+        }
         if (runningMetadata.putIfAbsent(infoHash, Boolean.TRUE) != null) {
+          if (lease != null) lease.close();
           catalog.queueMetadataJob(infoHash, Instant.now().plusSeconds(5), minimumPriority, true);
           metadataPermits.release();
           continue;
@@ -328,11 +340,13 @@ final class DhtCollector implements AutoCloseable {
             } catch (Exception error) {
               completeMetadataFailure(infoHash, error.getMessage());
             } finally {
+              if (lease != null) lease.close();
               runningMetadata.remove(infoHash);
               metadataPermits.release();
             }
           });
         } catch (RuntimeException error) {
+          if (lease != null) lease.close();
           runningMetadata.remove(infoHash);
           metadataPermits.release();
           throw error;
@@ -388,14 +402,22 @@ final class DhtCollector implements AutoCloseable {
       metadataPermits.release();
       return;
     }
+    TaskLease lease = TaskLease.tryAcquire(redis, infoHash);
+    if (redis != null && lease == null) {
+      runningDirectMetadata.remove(infoHash);
+      metadataPermits.release();
+      return;
+    }
     PeerSnapshot peers = currentAnnouncePeerSnapshot(infoHash);
     try {
       if (!catalog.claimImmediateMetadataJob(infoHash, Instant.now())) {
+        if (lease != null) lease.close();
         runningDirectMetadata.remove(infoHash);
         metadataPermits.release();
         return;
       }
     } catch (Exception error) {
+      if (lease != null) lease.close();
       runningDirectMetadata.remove(infoHash);
       metadataPermits.release();
       monitor.metric("collector.failed", 1);
@@ -412,6 +434,7 @@ final class DhtCollector implements AutoCloseable {
       } catch (Exception error) {
         completeDirectMetadataMiss(infoHash, error.getMessage());
       } finally {
+        if (lease != null) lease.close();
         runningDirectMetadata.remove(infoHash);
         metadataPermits.release();
         if (latestAnnouncePeerSequence(infoHash) > peers.sequence()) startMetadataForAnnounce(infoHash);
@@ -559,6 +582,18 @@ final class DhtCollector implements AutoCloseable {
         .replace("\n", "\\n").replace("\r", "\\r");
   }
 
+  private static JedisPooled connectRedis(String url) {
+    if (url == null || url.isBlank()) return null;
+    try {
+      JedisPooled client = new JedisPooled(java.net.URI.create(url));
+      client.ping();
+      return client;
+    } catch (RuntimeException error) {
+      System.err.println("task lease Redis unavailable; using database claims only: " + error.getMessage());
+      return null;
+    }
+  }
+
   private void flushQueries() throws Exception {
     for (var entry : queryCounts.entrySet()) {
       long count = entry.getValue().sumThenReset();
@@ -592,5 +627,6 @@ final class DhtCollector implements AutoCloseable {
       System.err.println("final catalog flush failed: " + error.getMessage());
     }
     monitor.close();
+    if (redis != null) redis.close();
   }
 }

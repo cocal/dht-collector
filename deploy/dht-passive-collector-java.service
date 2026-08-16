@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/vibe/dht-collector/java
 EnvironmentFile=/etc/dht-search/db.env
+EnvironmentFile=-/etc/dht-search/monitor-redis.env
 ExecStart=/usr/bin/java -Xms128m -Xmx768m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -jar /root/vibe/dht-collector/java/target/dht-collector-java-0.1.0.jar --mode collector --address 0.0.0.0 --port 51413 --dht-nodes 6 --max-concurrent 64 --metadata-concurrent 24 --metadata-timeout-seconds 20 --pool-size 5 --storage-path /root/vibe/dht-collector/var/java-dht
 Restart=on-failure
 RestartSec=15

@@ -16,6 +16,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -160,6 +161,9 @@ final class Catalog implements AutoCloseable {
     if (observations == null || observations.isEmpty()) {
       return new ObservationWrite(Set.of(), Set.of(), 0);
     }
+    observations = observations.stream()
+        .sorted(Comparator.comparing(DhtObservation::infoHash).thenComparing(DhtObservation::observedAt))
+        .toList();
     var fresh = new java.util.LinkedHashSet<String>();
     var immediate = new java.util.LinkedHashSet<String>();
     int peerFacts = 0;
