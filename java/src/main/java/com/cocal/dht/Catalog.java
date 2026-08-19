@@ -205,43 +205,53 @@ final class Catalog implements AutoCloseable {
           if (statementChanged(inserted[index])) fresh.add(resources.get(index).infoHash());
         }
 
-        try (PreparedStatement statement = connection.prepareStatement(
-            "UPDATE discovered_resource SET last_seen_at=greatest(last_seen_at,?),state='active' "
-                + "WHERE info_hash=?")) {
-          for (DhtObservation observation : resources) {
-            statement.setTimestamp(1, Timestamp.from(observation.observedAt()));
-            statement.setString(2, observation.infoHash());
-            statement.addBatch();
+        // Keep metadata-job row locks out of the high-volume observation transaction.
+        // Queue work before probe_event writes so metadata retrieval does not wait for
+        // the large fact table to extend or update its indexes.
+        List<DhtObservation> announces = resources.stream()
+            .filter(DhtObservation::isAnnounce).toList();
+        if (!fresh.isEmpty()) {
+          try (PreparedStatement statement = connection.prepareStatement(
+              "INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at) "
+                  + "SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) "
+                  + "ON CONFLICT(info_hash) DO NOTHING")) {
+            for (DhtObservation observation : resources) {
+              if (!fresh.contains(observation.infoHash())) continue;
+              Timestamp at = Timestamp.from(observation.observedAt());
+              statement.setString(1, observation.infoHash());
+              statement.setInt(2, observation.isAnnounce() ? 100 : 10);
+              statement.setInt(3, 0);
+              statement.setTimestamp(4, at);
+              statement.setTimestamp(5, at);
+              statement.setString(6, observation.infoHash());
+              statement.addBatch();
+            }
+            statement.executeBatch();
           }
-          statement.executeBatch();
         }
+        connection.commit();
 
-        int[] queued;
-        try (PreparedStatement statement = connection.prepareStatement(
-            "INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at) "
-                + "SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) "
-                + "ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,excluded.priority),"
-                + "next_attempt_at=CASE WHEN ? THEN least(metadata_job.next_attempt_at,excluded.next_attempt_at) "
-                + "ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at,status=CASE WHEN excluded.priority>=100 AND metadata_job.status='dead' THEN 'pending' ELSE metadata_job.status END,last_error=NULL")) {
-          for (DhtObservation observation : resources) {
-            int priority = observation.isAnnounce() ? 100 : 10;
-            Timestamp at = Timestamp.from(observation.observedAt());
-            statement.setString(1, observation.infoHash());
-            statement.setInt(2, priority);
-            statement.setInt(3, 0);
-            statement.setTimestamp(4, at);
-            statement.setTimestamp(5, at);
-            statement.setString(6, observation.infoHash());
-            statement.setBoolean(7, observation.isAnnounce());
-            statement.addBatch();
+        if (!announces.isEmpty()) {
+          try (PreparedStatement statement = connection.prepareStatement(
+              "INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at) "
+                  + "SELECT ?,100,0,?,? WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) "
+                  + "ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,100),"
+                  + "next_attempt_at=least(metadata_job.next_attempt_at,excluded.next_attempt_at),"
+                  + "updated_at=excluded.updated_at,status=CASE WHEN metadata_job.status='dead' THEN 'pending' ELSE metadata_job.status END,last_error=NULL")) {
+            for (DhtObservation observation : announces) {
+              Timestamp at = Timestamp.from(observation.observedAt());
+              statement.setString(1, observation.infoHash());
+              statement.setTimestamp(2, at);
+              statement.setTimestamp(3, at);
+              statement.setString(4, observation.infoHash());
+              statement.addBatch();
+            }
+            int[] accelerated = statement.executeBatch();
+            for (int index = 0; index < accelerated.length; index++) {
+              if (statementChanged(accelerated[index])) immediate.add(announces.get(index).infoHash());
+            }
           }
-          queued = statement.executeBatch();
-        }
-        for (int index = 0; index < queued.length; index++) {
-          DhtObservation observation = resources.get(index);
-          if (observation.isAnnounce() && statementChanged(queued[index])) {
-            immediate.add(observation.infoHash());
-          }
+          connection.commit();
         }
 
         try (PreparedStatement statement = connection.prepareStatement(
