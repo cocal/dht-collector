@@ -1,10 +1,9 @@
 # DHT Collector 0.1
 
-The production runtime is Java 21. One shaded jar provides passive Mainline
-DHT collection, BEP 9 metadata retrieval, PostgreSQL catalog access, the
-dashboard API/static UI, authorized indexing, JSONL catalog tools, and SQLite
-to PostgreSQL migration. It never downloads torrent payload pieces or writes
-to the DHT.
+The production collector runtime is Node.js. `src/passive-collector.js` handles
+passive Mainline DHT collection and BEP 9 metadata retrieval; the Java runtime
+remains available for catalog/dashboard utilities and diagnostics. The
+collector never downloads torrent payload pieces or writes to the DHT.
 
 ## Run
 
