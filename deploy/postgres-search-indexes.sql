@@ -20,6 +20,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS file_entry_path_search_idx
 CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_recent_due_idx
   ON metadata_job (priority DESC, updated_at DESC, next_attempt_at ASC);
 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_processing_lock_idx
+  ON metadata_job (locked_until, info_hash)
+  WHERE status = 'processing';
+
 -- Recover short-lived announce peer hints without scanning unrelated probe events.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS probe_event_recent_peer_idx
   ON probe_event (info_hash, occurred_at DESC)

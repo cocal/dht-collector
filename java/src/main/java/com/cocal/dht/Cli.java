@@ -149,7 +149,8 @@ final class Cli {
   /** Parse monitor.v1 records from a journal stream and batch them into minute_metric. */
   private static void monitorIngest(Args args) throws Exception {
     try (Catalog catalog = database(args, true)) {
-      catalog.initialize();
+      // The collector owns schema creation. Ingest is a read-journal worker and must not
+      // run ALTER TABLE on every restart while the collector is writing observations.
       Process journal = null;
       BufferedReader lines;
       Path input = args.path("input", null);

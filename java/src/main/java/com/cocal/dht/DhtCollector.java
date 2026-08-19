@@ -20,6 +20,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Predicate;
@@ -71,6 +72,8 @@ final class DhtCollector implements AutoCloseable {
   private final Map<String, LongAdder> queryCounts = new ConcurrentHashMap<>();
   private final Map<DHT, AtomicLong> incomingNodeProbeGates = new ConcurrentHashMap<>();
   private final AtomicLong peerSequence = new AtomicLong();
+  private final AtomicBoolean metadataRecoveryRunning = new AtomicBoolean();
+  private final AtomicLong metadataRecoveryAttemptNanos = new AtomicLong();
   private final AtomicLong discovered;
   private volatile Thread observationWriter;
   private volatile Thread metadataQueueReader;
@@ -86,7 +89,6 @@ final class DhtCollector implements AutoCloseable {
     this.taskConsumer = System.getenv().getOrDefault("DHT_NODE_ID",
         "collector-" + config.port() + "-" + ProcessHandle.current().pid());
     try {
-      catalog.loadRecentResources(Instant.now().minus(Duration.ofHours(24)), cache::load);
       this.discovered = new AtomicLong(
           config.maxResources() > 0 ? catalog.countDiscoveredResources() : 0);
     } catch (Exception error) {
@@ -404,12 +406,30 @@ final class DhtCollector implements AutoCloseable {
   }
 
   private void pollMetadataJobs() throws Exception {
-    int immediateReserve = Math.max(8, config.metadataConcurrent() / 4);
-    int fallbackReserve = Math.max(4, config.metadataConcurrent() / 4);
-    int liveCapacity = Math.max(0, metadataPermits.availablePermits() - immediateReserve - fallbackReserve);
+    long nowNanos = System.nanoTime();
+    long previousAttempt = metadataRecoveryAttemptNanos.get();
+    if (nowNanos - previousAttempt >= TimeUnit.SECONDS.toNanos(30)
+        && metadataRecoveryAttemptNanos.compareAndSet(previousAttempt, nowNanos)
+        && metadataRecoveryRunning.compareAndSet(false, true)) {
+      tasks.submit(() -> {
+        try {
+          int recovered = catalog.recoverExpiredMetadataJobs(Instant.now());
+          if (recovered > 0) monitor.metric("metadata.jobs_recovered", recovered);
+        } catch (Exception error) {
+          System.err.println("metadata lease recovery deferred: " + error.getMessage());
+        } finally {
+          metadataRecoveryRunning.set(false);
+        }
+      });
+    }
+
+    // Announce-triggered work acquires the same semaphore asynchronously. Use every
+    // currently free slot for high-priority jobs first, then leave one slot available
+    // for a new announce while draining the large fallback queue.
+    int liveCapacity = metadataPermits.availablePermits();
     if (liveCapacity > 0) launchMetadataJobs(liveCapacity, LIVE_METADATA_PRIORITY, liveMetadataTimeoutSeconds());
-    int fallbackCapacity = Math.min(fallbackReserve,
-        Math.max(0, metadataPermits.availablePermits() - immediateReserve));
+    int reservedForAnnounce = config.metadataConcurrent() > 1 ? 1 : 0;
+    int fallbackCapacity = Math.max(0, metadataPermits.availablePermits() - reservedForAnnounce);
     if (fallbackCapacity > 0) launchMetadataJobs(fallbackCapacity, 0, LIVE_METADATA_PRIORITY, config.metadataTimeoutSeconds());
   }
 

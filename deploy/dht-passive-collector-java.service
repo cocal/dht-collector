@@ -1,14 +1,14 @@
 [Unit]
 Description=Mainline DHT collector and metadata worker (Java)
-After=network-online.target dht-db-writer.service
-Wants=network-online.target dht-db-writer.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/root/vibe/dht-collector/java
 EnvironmentFile=/etc/dht-search/db.env
 EnvironmentFile=-/etc/dht-search/monitor-redis.env
-ExecStart=/usr/bin/java -Xms128m -Xmx768m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -jar /opt/dht-collector/dht-collector-java.jar --mode collector --address 0.0.0.0 --port 51413 --dht-nodes 6 --max-concurrent 64 --metadata-concurrent 8 --metadata-timeout-seconds 20 --pool-size 3 --storage-path /root/vibe/dht-collector/var/java-dht
+ExecStart=/usr/bin/java -Xms128m -Xmx768m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -jar /opt/dht-collector/dht-collector-java.jar --mode collector --address 0.0.0.0 --port 51413 --dht-nodes 6 --max-concurrent 64 --metadata-concurrent 6 --metadata-timeout-seconds 20 --pool-size 6 --storage-path /root/vibe/dht-collector/var/java-dht
 Restart=on-failure
 RestartSec=15
 SuccessExitStatus=143
