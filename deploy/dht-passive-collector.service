@@ -1,5 +1,5 @@
 [Unit]
-Description=Passive Mainline DHT collector (Node.js)
+Description=Passive Mainline DHT collector (Java)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,8 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/vibe/dht-collector
 EnvironmentFile=/root/.config/dht-search/db.env
-Environment=PGPOOL_MAX=5
-ExecStart=/usr/bin/node src/passive-collector.js --db /root/vibe/dht-collector/var/dht-search.db --quiet --port 51413 --dht-nodes 12 --max-resources 0 --max-concurrent 160 --dht-concurrency 80 --max-pending 1280 --lookup-timeout-ms 10000 --metadata-timeout-ms 3500 --max-peers-per-infohash 10
+ExecStart=/usr/bin/java -Xms64m -Xmx640m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError -jar /opt/dht-collector/dht-collector-java.jar --mode collector --address 0.0.0.0 --port 51413 --dht-nodes 12 --max-concurrent 160 --metadata-concurrent 16 --metadata-timeout-seconds 10 --pool-size 5 --storage-path /root/vibe/dht-collector/var/java-dht
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=45

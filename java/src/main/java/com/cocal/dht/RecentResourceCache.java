@@ -5,6 +5,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 final class RecentResourceCache {
+  private static final int MAX_ENTRIES = 50_000;
   private final long ttlMillis;
   private final Map<String, Long> observed = new ConcurrentHashMap<>();
   RecentResourceCache(long ttlMillis) { this.ttlMillis = ttlMillis; }
@@ -20,7 +21,12 @@ final class RecentResourceCache {
     if (seen < now - ttlMillis) { observed.remove(hash, seen); return false; }
     return true;
   }
-  void observe(String hash, long now) { observed.put(hash, now); }
+  void observe(String hash, long now) {
+    observed.put(hash, now);
+    if (observed.size() <= MAX_ENTRIES) return;
+    int remove = observed.size() - MAX_ENTRIES;
+    observed.keySet().stream().limit(remove).forEach(observed::remove);
+  }
   void remove(String hash) { observed.remove(hash); }
   int prune(long now) { int removed = 0; long cutoff = now - ttlMillis; for (var entry : observed.entrySet()) if (entry.getValue() < cutoff && observed.remove(entry.getKey(), entry.getValue())) removed++; return removed; }
   int size() { return observed.size(); }

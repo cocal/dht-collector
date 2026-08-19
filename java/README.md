@@ -46,7 +46,7 @@ java -jar target/dht-collector-java-0.1.0.jar --mode monitor-ingest \
 
 `DATABASE_URL`, `PGUSER`, and `PGPASSWORD` are read from the process
 environment. Keep that environment file outside the repository. The collector
-loads only active resources observed in the last 24 hours into memory and uses
+keeps a bounded cache of active resources observed in the last 2 hours and uses
 the database as the source of truth for older cache misses. Repeated sightings
 are flushed to PostgreSQL in bounded batches every 30 seconds. The metadata
 worker claims persisted jobs, verifies the returned info dictionary against

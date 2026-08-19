@@ -213,8 +213,13 @@ final class MetadataFetcher implements AutoCloseable {
             launchDirect.run();
           });
     };
-    var task = preferredPeerSet.isEmpty() ? fetcher.fetch(key)
-        : fetcher.fetch(key, fetchTask -> preferredPeerSet.forEach(peer -> FetchTaskPeerHints.add(fetchTask, peer)));
+    var task = fetcher.fetch(key, fetchTask -> {
+      preferredPeerSet.forEach(peer -> FetchTaskPeerHints.add(fetchTask, peer));
+      fetchTask.configureLookup(lookup -> {
+        lookup.setNoAnnounce(true);
+        lookup.setFastTerminate(true);
+      });
+    });
     taskRef.set(task);
     activeTasks.add(task);
     PeerLookupTask lookup = startPeerLookup(infoHash, peer -> {
@@ -278,7 +283,10 @@ final class MetadataFetcher implements AutoCloseable {
       if (server == null) continue;
       PeerLookupTask lookup = new PeerLookupTask(server, dht.getNode(), new Key(infoHash));
       lookup.setNoAnnounce(true);
-      lookup.setFastTerminate(false);
+      // Stop a lookup once it has produced enough peers for metadata retrieval.
+      // Full graph walks retain every candidate/RPC object and can starve the
+      // collector even though one usable peer is already available.
+      lookup.setFastTerminate(true);
       lookup.setResultHandler((source, item) -> {
         if (item != null) onPeer.accept(item.toSocketAddress());
       });

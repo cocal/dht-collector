@@ -13,4 +13,10 @@ class RecentResourceCacheTest {
     assertTrue(cache.contains("a", now));
     assertFalse(cache.contains("b", now));
   }
+
+  @Test void boundsLiveEntries() {
+    RecentResourceCache cache = new RecentResourceCache(60_000);
+    for (int index = 0; index < 50_100; index++) cache.observe("hash-" + index, index);
+    assertEquals(50_000, cache.size());
+  }
 }

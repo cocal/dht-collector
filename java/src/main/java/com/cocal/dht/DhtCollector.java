@@ -33,7 +33,7 @@ import lbms.plugins.mldht.kad.messages.MessageBase;
 import redis.clients.jedis.JedisPooled;
 
 final class DhtCollector implements AutoCloseable {
-  static final long CACHE_TTL_MS = Duration.ofHours(24).toMillis();
+  static final long CACHE_TTL_MS = Duration.ofHours(2).toMillis();
   static final long ANNOUNCE_PEER_TTL_MS = Duration.ofMinutes(10).toMillis();
   static final int LIVE_METADATA_PRIORITY = 100;
   static final int LIVE_METADATA_TIMEOUT_SECONDS = 30;

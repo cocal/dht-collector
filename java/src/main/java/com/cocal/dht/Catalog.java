@@ -29,7 +29,7 @@ import java.util.function.BiConsumer;
 
 final class Catalog implements AutoCloseable {
   private static final int TOUCH_BATCH_SIZE = 1_000;
-  private static final int RECENT_RESOURCE_CACHE_LIMIT = 250_000;
+  private static final int RECENT_RESOURCE_CACHE_LIMIT = 50_000;
   private static final String CONTENT_SEARCH_HEAD = "to_tsvector('simple', left(coalesce(c.name,'') || ' ' || coalesce(c.files_text,''), 800000))";
   private static final String CONTENT_SEARCH_TAIL = "to_tsvector('simple', substring(coalesce(c.files_text,'') from 700001 for 800000))";
   private static final String CONTENT_SEARCH_MATCH = "(" + CONTENT_SEARCH_HEAD + " @@ s.term OR (length(c.files_text) > 700000 AND " + CONTENT_SEARCH_TAIL + " @@ s.term))";
@@ -84,32 +84,51 @@ final class Catalog implements AutoCloseable {
       try (ResultSet ignored = statement.executeQuery("SELECT pg_advisory_lock(hashtextextended('dht-collector-schema', 0))")) { }
       try {
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS content (content_id text PRIMARY KEY, info_hash text NOT NULL UNIQUE, variant text NOT NULL, name text NOT NULL, total_size bigint NOT NULL, file_count integer NOT NULL, metadata_size integer NOT NULL, metadata_sha256 text NOT NULL, policy_state text NOT NULL DEFAULT 'approved', files_text text NOT NULL DEFAULT '', created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)");
-        statement.executeUpdate("ALTER TABLE content ADD COLUMN IF NOT EXISTS files_text text NOT NULL DEFAULT ''");
+        addColumnIfMissing(connection, statement, "content", "files_text", "text NOT NULL DEFAULT ''");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS content_updated_idx ON content (updated_at DESC)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS file_entry (content_id text NOT NULL REFERENCES content(content_id) ON DELETE CASCADE, ordinal integer NOT NULL, path text NOT NULL, size bigint NOT NULL, PRIMARY KEY (content_id, ordinal))");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS discovered_resource (info_hash text PRIMARY KEY, first_seen_at timestamptz NOT NULL, last_seen_at timestamptz NOT NULL, source text NOT NULL, state text NOT NULL DEFAULT 'active')");
-        statement.executeUpdate("ALTER TABLE discovered_resource ADD COLUMN IF NOT EXISTS last_seen_at timestamptz");
-        statement.executeUpdate("ALTER TABLE discovered_resource ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'active'");
-        statement.executeUpdate("UPDATE discovered_resource SET last_seen_at=COALESCE(last_seen_at, first_seen_at),state=COALESCE(state,'active') WHERE last_seen_at IS NULL OR state IS NULL");
+        boolean addedLastSeen = addColumnIfMissing(connection, statement, "discovered_resource",
+            "last_seen_at", "timestamptz");
+        boolean addedState = addColumnIfMissing(connection, statement, "discovered_resource",
+            "state", "text NOT NULL DEFAULT 'active'");
+        if (addedLastSeen || addedState) {
+          statement.executeUpdate("UPDATE discovered_resource SET last_seen_at=COALESCE(last_seen_at, first_seen_at),state=COALESCE(state,'active') WHERE last_seen_at IS NULL OR state IS NULL");
+        }
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS discovered_resource_state_seen_idx ON discovered_resource (state, last_seen_at)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS probe_event (event_id text PRIMARY KEY, event_type text NOT NULL, occurred_at timestamptz NOT NULL, info_hash text, peer_host text, peer_port integer, source_host text, source_port integer, mode text, message text, raw_event jsonb NOT NULL)");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_occurred_at_idx ON probe_event (occurred_at DESC)");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_info_hash_idx ON probe_event (info_hash, occurred_at DESC)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS metadata_job (info_hash text PRIMARY KEY, priority integer NOT NULL DEFAULT 0, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, status text NOT NULL DEFAULT 'pending', locked_by text, locked_until timestamptz, last_error text)");
-        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'pending'");
-        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS locked_by text");
-        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS locked_until timestamptz");
-        statement.executeUpdate("ALTER TABLE metadata_job ADD COLUMN IF NOT EXISTS last_error text");
+        addColumnIfMissing(connection, statement, "metadata_job", "status", "text NOT NULL DEFAULT 'pending'");
+        addColumnIfMissing(connection, statement, "metadata_job", "locked_by", "text");
+        addColumnIfMissing(connection, statement, "metadata_job", "locked_until", "timestamptz");
+        addColumnIfMissing(connection, statement, "metadata_job", "last_error", "text");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_status_due_idx ON metadata_job (status, priority DESC, next_attempt_at ASC, updated_at DESC)");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_due_idx ON metadata_job (priority DESC, next_attempt_at ASC, updated_at DESC)");
         statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_processing_lock_idx ON metadata_job (locked_until, info_hash) WHERE status='processing'");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS catalog_counter (name text PRIMARY KEY, value bigint NOT NULL DEFAULT 0)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS minute_metric (bucket timestamptz PRIMARY KEY, links bigint NOT NULL DEFAULT 0, queries bigint NOT NULL DEFAULT 0, failures bigint NOT NULL DEFAULT 0, warnings bigint NOT NULL DEFAULT 0, indexed bigint NOT NULL DEFAULT 0)");
-        statement.executeUpdate("ALTER TABLE minute_metric ADD COLUMN IF NOT EXISTS indexed bigint NOT NULL DEFAULT 0");
+        addColumnIfMissing(connection, statement, "minute_metric", "indexed", "bigint NOT NULL DEFAULT 0");
       } finally {
         try (ResultSet ignored = statement.executeQuery("SELECT pg_advisory_unlock(hashtextextended('dht-collector-schema', 0))")) { }
       }
     }
+  }
+
+  private static boolean addColumnIfMissing(Connection connection, Statement statement,
+                                             String table, String column, String definition)
+      throws SQLException {
+    try (PreparedStatement check = connection.prepareStatement(
+        "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?")) {
+      check.setString(1, table);
+      check.setString(2, column);
+      try (ResultSet rows = check.executeQuery()) {
+        if (rows.next()) return false;
+      }
+    }
+    statement.executeUpdate("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+    return true;
   }
 
   int loadRecentResources(Instant cutoff, BiConsumer<String, Instant> consumer) throws SQLException {
@@ -622,7 +641,13 @@ final class Catalog implements AutoCloseable {
   }
 
   int markInvalidResources(Instant cutoff) throws SQLException {
-    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("UPDATE discovered_resource SET state='invalid' WHERE state!='invalid' AND last_seen_at < ?")) {
+    String sql = "WITH expired AS (SELECT info_hash FROM discovered_resource "
+        + "WHERE state='active' AND last_seen_at < ? ORDER BY last_seen_at "
+        + "FOR UPDATE SKIP LOCKED LIMIT 10000) "
+        + "UPDATE discovered_resource d SET state='invalid' FROM expired "
+        + "WHERE d.info_hash=expired.info_hash";
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement(sql)) {
+      statement.setQueryTimeout(15);
       statement.setTimestamp(1, Timestamp.from(cutoff));
       return statement.executeUpdate();
     }
