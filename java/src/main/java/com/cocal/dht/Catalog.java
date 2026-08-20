@@ -81,11 +81,17 @@ final class Catalog implements AutoCloseable {
 
   void initialize() throws SQLException {
     try (Connection connection = dataSource.getConnection(); Statement statement = connection.createStatement()) {
-      try (ResultSet ignored = statement.executeQuery("SELECT pg_advisory_lock(hashtextextended('dht-collector-schema', 0))")) { }
+      statement.setQueryTimeout(15);
+      statement.execute("SET lock_timeout = '3s'");
+      try (ResultSet lock = statement.executeQuery("SELECT pg_try_advisory_lock(hashtextextended('dht-collector-schema', 0))")) {
+        if (!lock.next() || !lock.getBoolean(1)) {
+          throw new SQLException("schema initialization is already running");
+        }
+      }
       try {
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS content (content_id text PRIMARY KEY, info_hash text NOT NULL UNIQUE, variant text NOT NULL, name text NOT NULL, total_size bigint NOT NULL, file_count integer NOT NULL, metadata_size integer NOT NULL, metadata_sha256 text NOT NULL, policy_state text NOT NULL DEFAULT 'approved', files_text text NOT NULL DEFAULT '', created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)");
         addColumnIfMissing(connection, statement, "content", "files_text", "text NOT NULL DEFAULT ''");
-        statement.executeUpdate("CREATE INDEX IF NOT EXISTS content_updated_idx ON content (updated_at DESC)");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS content_updated_idx ON content (updated_at DESC)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS file_entry (content_id text NOT NULL REFERENCES content(content_id) ON DELETE CASCADE, ordinal integer NOT NULL, path text NOT NULL, size bigint NOT NULL, PRIMARY KEY (content_id, ordinal))");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS discovered_resource (info_hash text PRIMARY KEY, first_seen_at timestamptz NOT NULL, last_seen_at timestamptz NOT NULL, source text NOT NULL, state text NOT NULL DEFAULT 'active')");
         boolean addedLastSeen = addColumnIfMissing(connection, statement, "discovered_resource",
@@ -95,24 +101,35 @@ final class Catalog implements AutoCloseable {
         if (addedLastSeen || addedState) {
           statement.executeUpdate("UPDATE discovered_resource SET last_seen_at=COALESCE(last_seen_at, first_seen_at),state=COALESCE(state,'active') WHERE last_seen_at IS NULL OR state IS NULL");
         }
-        statement.executeUpdate("CREATE INDEX IF NOT EXISTS discovered_resource_state_seen_idx ON discovered_resource (state, last_seen_at)");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS discovered_resource_state_seen_idx ON discovered_resource (state, last_seen_at)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS probe_event (event_id text PRIMARY KEY, event_type text NOT NULL, occurred_at timestamptz NOT NULL, info_hash text, peer_host text, peer_port integer, source_host text, source_port integer, mode text, message text, raw_event jsonb NOT NULL)");
-        statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_occurred_at_idx ON probe_event (occurred_at DESC)");
-        statement.executeUpdate("CREATE INDEX IF NOT EXISTS probe_event_info_hash_idx ON probe_event (info_hash, occurred_at DESC)");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS probe_event_occurred_at_idx ON probe_event (occurred_at DESC)");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS probe_event_info_hash_idx ON probe_event (info_hash, occurred_at DESC)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS metadata_job (info_hash text PRIMARY KEY, priority integer NOT NULL DEFAULT 0, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, status text NOT NULL DEFAULT 'pending', locked_by text, locked_until timestamptz, last_error text)");
         addColumnIfMissing(connection, statement, "metadata_job", "status", "text NOT NULL DEFAULT 'pending'");
         addColumnIfMissing(connection, statement, "metadata_job", "locked_by", "text");
         addColumnIfMissing(connection, statement, "metadata_job", "locked_until", "timestamptz");
         addColumnIfMissing(connection, statement, "metadata_job", "last_error", "text");
-        statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_status_due_idx ON metadata_job (status, priority DESC, next_attempt_at ASC, updated_at DESC)");
-        statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_due_idx ON metadata_job (priority DESC, next_attempt_at ASC, updated_at DESC)");
-        statement.executeUpdate("CREATE INDEX IF NOT EXISTS metadata_job_processing_lock_idx ON metadata_job (locked_until, info_hash) WHERE status='processing'");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_status_due_idx ON metadata_job (status, priority DESC, next_attempt_at ASC, updated_at DESC)");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_due_idx ON metadata_job (priority DESC, next_attempt_at ASC, updated_at DESC)");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_processing_lock_idx ON metadata_job (locked_until, info_hash) WHERE status='processing'");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS catalog_counter (name text PRIMARY KEY, value bigint NOT NULL DEFAULT 0)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS minute_metric (bucket timestamptz PRIMARY KEY, links bigint NOT NULL DEFAULT 0, queries bigint NOT NULL DEFAULT 0, failures bigint NOT NULL DEFAULT 0, warnings bigint NOT NULL DEFAULT 0, indexed bigint NOT NULL DEFAULT 0)");
         addColumnIfMissing(connection, statement, "minute_metric", "indexed", "bigint NOT NULL DEFAULT 0");
       } finally {
         try (ResultSet ignored = statement.executeQuery("SELECT pg_advisory_unlock(hashtextextended('dht-collector-schema', 0))")) { }
       }
+    }
+  }
+
+  private static void createIndexIfMissing(Statement statement, String sql) throws SQLException {
+    try {
+      statement.executeUpdate(sql);
+    } catch (SQLException error) {
+      // Index creation takes a relation lock. A busy writer must not keep the service
+      // in startup forever; the next restart or a DBA migration can retry it safely.
+      if (!"55P03".equals(error.getSQLState())) throw error;
+      System.err.println("schema index deferred: " + error.getMessage());
     }
   }
 
