@@ -141,6 +141,13 @@ final class MetadataFetcher implements AutoCloseable {
                                                             Collection<InetSocketAddress> preferredPeers,
                                                             int taskTimeoutSeconds) {
     if (closing.get()) return CompletableFuture.completedFuture(Optional.empty());
+    // mldht retains killed lookup graphs for a while. Refuse new graph creation once the
+    // bounded worker budget is saturated; passive discovery and DB writes remain healthy.
+    int lookupLimit = Math.max(4, maxConcurrent * 2);
+    if (activeLookups.size() >= lookupLimit) {
+      metric.accept("metadata.dht_lookup_saturated", 1L);
+      return CompletableFuture.completedFuture(Optional.empty());
+    }
     Key key = new Key(infoHash);
     metric.accept("metadata.dht_fetch_started", 1L);
     CompletableFuture<Optional<Manifest>> result = new CompletableFuture<>();
@@ -279,6 +286,11 @@ final class MetadataFetcher implements AutoCloseable {
 
   private PeerLookupTask startPeerLookup(String infoHash, Consumer<InetSocketAddress> onPeer,
                                          Runnable onComplete) {
+    if (activeLookups.size() >= Math.max(4, maxConcurrent * 2)) {
+      metric.accept("metadata.dht_lookup_saturated", 1L);
+      onComplete.run();
+      return null;
+    }
     for (int nodeIndex : lookupNodeOrder(dhtNodes.size(), lookupCursor.getAndIncrement())) {
       DHT dht = dhtNodes.get(nodeIndex);
       RPCServer server = dht.getServerManager().getRandomActiveServer(true);
