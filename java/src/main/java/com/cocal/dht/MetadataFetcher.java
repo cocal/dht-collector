@@ -43,6 +43,7 @@ final class MetadataFetcher implements AutoCloseable {
   private final List<DHT> dhtNodes;
   private final DirectMetadataFetcher direct;
   private final int timeoutSeconds;
+  private final int maxConcurrent;
   private final BiConsumer<String, Long> metric;
   private final ConcurrentHashMap.KeySetView<TorrentFetcher.FetchTask, Boolean> activeTasks = ConcurrentHashMap.newKeySet();
   private final ConcurrentHashMap.KeySetView<PeerLookupTask, Boolean> activeLookups = ConcurrentHashMap.newKeySet();
@@ -62,6 +63,7 @@ final class MetadataFetcher implements AutoCloseable {
     fetcher.setMaxOpen(Math.max(1, maxConcurrent));
     fetcher.setMaxSockets(Math.max(8, maxConcurrent * 4));
     this.timeoutSeconds = timeoutSeconds;
+    this.maxConcurrent = Math.max(1, maxConcurrent);
     this.metric = metric == null ? (ignored, value) -> { } : metric;
     this.direct = new DirectMetadataFetcher(this.metric);
   }
@@ -321,6 +323,24 @@ final class MetadataFetcher implements AutoCloseable {
 
   long activeDhtTasks() {
     return dhtNodes.stream().mapToLong(dht -> dht.getTaskManager().getActiveTasks().length).sum();
+  }
+
+  /** Prevent a faulty peer lookup from retaining an unbounded graph in the mldht task manager. */
+  void reapIfOverloaded() {
+    int limit = Math.max(16, maxConcurrent * 2);
+    if (activeTasks.size() <= limit && activeLookups.size() <= limit) return;
+    int tasks = 0;
+    for (TorrentFetcher.FetchTask task : activeTasks) {
+      task.stop();
+      tasks++;
+    }
+    int lookups = 0;
+    for (PeerLookupTask lookup : activeLookups) {
+      lookup.kill();
+      lookups++;
+    }
+    metric.accept("metadata.tasks_reaped", (long) tasks + lookups);
+    System.err.println("reaped overloaded metadata tasks: fetch=" + tasks + ", lookup=" + lookups);
   }
 
   static Manifest parse(ByteBuffer input, String expectedHash) {

@@ -163,6 +163,7 @@ final class DhtCollector implements AutoCloseable {
     }
     scheduler.scheduleWithFixedDelay(() -> {
       long routingNodes = nodes.stream().mapToLong(node -> node.getNode().getNumEntriesInRoutingTable()).sum();
+      metadata.reapIfOverloaded();
       if (routingNodes > 0) monitor.metric("dht.routing_nodes", routingNodes);
       long activeTasks = metadata.activeDhtTasks();
       long queuedTasks = metadata.queuedDhtTasks();
@@ -172,7 +173,7 @@ final class DhtCollector implements AutoCloseable {
       if (observationDepth > 0) monitor.metric("collector.observation_queue_depth", observationDepth);
       long droppedObservations = observationQueue.droppedSinceLastReport();
       if (droppedObservations > 0) monitor.metric("collector.observation_dropped", droppedObservations);
-    }, 30, 60, TimeUnit.SECONDS);
+    }, 15, 15, TimeUnit.SECONDS);
     scheduler.scheduleWithFixedDelay(() -> {
       try { catalog.markInvalidResources(Instant.now().minus(Duration.ofDays(7))); }
       catch (Exception error) {
