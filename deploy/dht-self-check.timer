@@ -1,0 +1,11 @@
+[Unit]
+Description=Run DHT service health check every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=dht-self-check.service
+
+[Install]
+WantedBy=timers.target

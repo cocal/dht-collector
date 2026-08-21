@@ -164,6 +164,25 @@ redis.connected_clients
 Redis 不可用时，检查服务仍会记录 `redis.error`；它不会依赖 Redis 写回自身，
 因此外部 monitor-center 可以从 `dht-redis-monitor.service` journal 发现故障。
 
+### 服务自检与自动恢复
+
+主机可启用 `dht-self-check.timer`，每分钟检查关键服务是否仍在运行，并对
+KeyDB 执行 `PING`、对 Dashboard 执行 `/api/system` 健康检查。发现明确故障时，
+脚本按依赖顺序执行 `systemctl restart`，每个 unit 有 5 分钟冷却时间，避免
+故障期间产生重启风暴：
+
+```bash
+install -m 0755 scripts/dht-self-check.sh /usr/local/sbin/dht-self-check.sh
+install -m 0644 deploy/dht-self-check.service /etc/systemd/system/
+install -m 0644 deploy/dht-self-check.timer /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now dht-self-check.timer
+```
+
+自检日志写入 `journalctl -u dht-self-check.service` 和 syslog 的
+`dht-self-check` 标签。它只负责恢复进程或明确不可用的依赖，不把“当前没有
+新增资源”误判为 DHT 故障。
+
 ### 多节点模式
 
 ```text

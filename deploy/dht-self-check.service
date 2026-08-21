@@ -1,0 +1,12 @@
+[Unit]
+Description=DHT service health check and recovery
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dht-self-check.sh
+User=root
+NoNewPrivileges=false
+PrivateTmp=true
+TimeoutStartSec=30s
