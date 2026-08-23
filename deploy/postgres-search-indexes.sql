@@ -20,6 +20,12 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS file_entry_path_search_idx
 CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_recent_due_idx
   ON metadata_job (priority DESC, updated_at DESC, next_attempt_at ASC);
 
+-- The worker only claims pending jobs. Keeping that predicate in the index avoids
+-- scanning millions of completed/processing rows on every small claim batch.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_pending_due_idx
+  ON metadata_job (priority DESC, updated_at DESC, next_attempt_at ASC, info_hash)
+  WHERE status = 'pending';
+
 CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_processing_lock_idx
   ON metadata_job (locked_until, info_hash)
   WHERE status = 'processing';
