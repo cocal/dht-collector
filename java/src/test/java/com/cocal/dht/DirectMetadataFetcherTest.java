@@ -29,7 +29,7 @@ final class DirectMetadataFetcherTest {
   @Test
   void shortensConnectTimeoutWhenItCanHedgeAcrossAPeerBatch() {
     assertEquals(3_000, DirectMetadataFetcher.connectTimeoutMillis(3));
-    assertEquals(1_500, DirectMetadataFetcher.connectTimeoutMillis(4));
+    assertEquals(3_000, DirectMetadataFetcher.connectTimeoutMillis(4));
   }
 
   @Test

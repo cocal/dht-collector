@@ -42,7 +42,9 @@ final class DirectMetadataFetcher implements AutoCloseable {
   static final int MAX_PEERS_PER_FETCH = 24;
   private static final int PEER_BATCH_SIZE = 4;
   private static final int DEFAULT_CONNECT_TIMEOUT_MILLIS = 3_000;
-  private static final int HEDGED_CONNECT_TIMEOUT_MILLIS = 1_500;
+  // Public BitTorrent peers often need more than one RTT to accept a TCP
+  // connection. A 1.5s hedge discarded otherwise usable peers too early.
+  private static final int HEDGED_CONNECT_TIMEOUT_MILLIS = 3_000;
   private static final long TRANSIENT_PENALTY_MILLIS = TimeUnit.MINUTES.toMillis(5);
   private static final long PROTOCOL_PENALTY_MILLIS = TimeUnit.MINUTES.toMillis(15);
   private static final long HASH_MISMATCH_PENALTY_MILLIS = TimeUnit.MINUTES.toMillis(30);
