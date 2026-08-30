@@ -261,9 +261,7 @@ final class Catalog implements AutoCloseable {
         // the large fact table to extend or update its indexes.
         List<DhtObservation> announces = resources.stream()
             .filter(DhtObservation::isAnnounce).toList();
-        List<DhtObservation> lookupJobs = resources.stream()
-            .filter(observation -> !observation.isAnnounce())
-            .limit(MAX_RECENT_LOOKUP_JOBS_PER_BATCH).toList();
+        List<DhtObservation> lookupJobs = List.of();
         if (!fresh.isEmpty()) {
           try (PreparedStatement statement = connection.prepareStatement(
               "INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at) "

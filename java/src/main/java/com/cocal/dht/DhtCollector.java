@@ -436,7 +436,7 @@ final class DhtCollector implements AutoCloseable {
     if (liveCapacity > 0) launchMetadataJobs(liveCapacity, LIVE_METADATA_PRIORITY, liveMetadataTimeoutSeconds());
     // Probe only a tiny number of newly observed get_peers resources after direct
     // announce work. Candidate selection remains bounded to recent indexed rows.
-    int lookupCapacity = Math.min(2, metadataPermits.availablePermits());
+    int lookupCapacity = 0;
     if (lookupCapacity > 0) launchMetadataJobs(lookupCapacity, RECENT_LOOKUP_PRIORITY,
         LIVE_METADATA_PRIORITY, liveMetadataTimeoutSeconds());
   }
@@ -610,14 +610,9 @@ final class DhtCollector implements AutoCloseable {
                                                          int timeoutSeconds) throws Exception {
     var direct = metadata.fetchDirect(infoHash, peers, timeoutSeconds).toCompletableFuture()
         .get(timeoutSeconds + 5L, TimeUnit.SECONDS);
-    if (direct.isPresent() || !hotFallbackPermits.tryAcquire()) return direct;
-    try {
-      monitor.metric("metadata.hot_fallback_started", 1);
-      return metadata.fetchHotFallback(infoHash, peers, timeoutSeconds).toCompletableFuture()
-          .get(timeoutSeconds + 5L, TimeUnit.SECONDS);
-    } finally {
-      hotFallbackPermits.release();
-    }
+    // A DHT graph is deliberately disabled for the passive collector. mldht keeps
+    // graph tasks beyond the request deadline; replaying them causes saturation.
+    return direct;
   }
 
   private Collection<InetSocketAddress> currentAnnouncePeers(String infoHash) {
