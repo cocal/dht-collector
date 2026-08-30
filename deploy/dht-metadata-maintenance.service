@@ -1,0 +1,15 @@
+[Unit]
+Description=Maintain DHT metadata retry queue statistics
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/root/.config/dht-search/db.env
+ExecStart=/usr/local/sbin/dht-metadata-maintenance.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=30min
+PrivateTmp=true
+NoNewPrivileges=true

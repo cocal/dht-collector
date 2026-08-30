@@ -382,3 +382,13 @@ PGOPTIONS='-c statement_timeout=0' psql -v ON_ERROR_STOP=1 \\
 维护后用 `EXPLAIN` 和带 5 秒 `statement_timeout` 的 pending hot 查询复测；若查询仍
 超时，应先检查 `pg_stat_progress_vacuum`、索引膨胀和磁盘 I/O，不要直接扩大 worker
 并发。
+
+生产环境可安装 `deploy/dht-metadata-maintenance.service` 和对应 timer，由 systemd
+每日低优先级执行同一维护命令：
+
+```bash
+install -m 0755 scripts/dht-metadata-maintenance.sh /usr/local/sbin/
+install -m 0644 deploy/dht-metadata-maintenance.{service,timer} /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now dht-metadata-maintenance.timer
+```
