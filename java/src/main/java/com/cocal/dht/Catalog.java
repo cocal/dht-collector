@@ -510,7 +510,11 @@ final class Catalog implements AutoCloseable {
   boolean queueMetadataJob(String hash, Instant at, int priority, boolean accelerate) throws SQLException {
     try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at,status) SELECT ?,?,?,?,?,'pending' WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(metadata_job.priority,excluded.priority),next_attempt_at=CASE WHEN ? THEN least(metadata_job.next_attempt_at,excluded.next_attempt_at) ELSE metadata_job.next_attempt_at END,updated_at=excluded.updated_at,status=CASE WHEN metadata_job.status='processing' THEN metadata_job.status ELSE 'pending' END,last_error=NULL")) {
       connection.setAutoCommit(false);
-      statement.setString(1, hash); statement.setInt(2, priority); statement.setInt(3, 0); statement.setTimestamp(4, Timestamp.from(at)); statement.setTimestamp(5, Timestamp.from(at)); statement.setString(6, hash); statement.setBoolean(7, accelerate); boolean changed = statement.executeUpdate() > 0; connection.commit(); return changed;
+      try {
+        statement.setQueryTimeout(5);
+        statement.setString(1, hash); statement.setInt(2, priority); statement.setInt(3, 0); statement.setTimestamp(4, Timestamp.from(at)); statement.setTimestamp(5, Timestamp.from(at)); statement.setString(6, hash); statement.setBoolean(7, accelerate); boolean changed = statement.executeUpdate() > 0; connection.commit(); return changed;
+      } catch (SQLException error) { connection.rollback(); throw error; }
+      finally { connection.setAutoCommit(true); }
     }
   }
 
@@ -585,9 +589,13 @@ final class Catalog implements AutoCloseable {
     List<String> result = new ArrayList<>();
     try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("WITH due AS (SELECT j.info_hash FROM metadata_job j WHERE j.status='pending' AND j.next_attempt_at <= ?::timestamptz AND j.priority >= ? AND j.priority < ? AND EXISTS (SELECT 1 FROM discovered_resource r WHERE r.info_hash=j.info_hash AND r.state='active' AND r.last_seen_at >= ?::timestamptz) AND NOT EXISTS (SELECT 1 FROM content c WHERE c.info_hash=j.info_hash) ORDER BY j.priority DESC,j.updated_at DESC,j.next_attempt_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT ?) UPDATE metadata_job j SET attempts=j.attempts+1,priority=0,next_attempt_at=?::timestamptz + interval '90 seconds',updated_at=?::timestamptz,status='processing',locked_by=current_setting('application_name',true),locked_until=?::timestamptz + interval '90 seconds' FROM due WHERE j.info_hash=due.info_hash RETURNING j.info_hash")) {
       connection.setAutoCommit(false);
-      Timestamp timestamp = Timestamp.from(at); Timestamp recent = Timestamp.from(at.minus(java.time.Duration.ofHours(24))); statement.setTimestamp(1, timestamp); statement.setInt(2, minimumPriority); statement.setInt(3, maximumPriority); statement.setTimestamp(4, recent); statement.setInt(5, limit); statement.setTimestamp(6, timestamp); statement.setTimestamp(7, timestamp); statement.setTimestamp(8, timestamp);
-      try (ResultSet rows = statement.executeQuery()) { while (rows.next()) result.add(rows.getString(1)); }
-      connection.commit();
+      try {
+        statement.setQueryTimeout(5);
+        Timestamp timestamp = Timestamp.from(at); Timestamp recent = Timestamp.from(at.minus(java.time.Duration.ofHours(24))); statement.setTimestamp(1, timestamp); statement.setInt(2, minimumPriority); statement.setInt(3, maximumPriority); statement.setTimestamp(4, recent); statement.setInt(5, limit); statement.setTimestamp(6, timestamp); statement.setTimestamp(7, timestamp); statement.setTimestamp(8, timestamp);
+        try (ResultSet rows = statement.executeQuery()) { while (rows.next()) result.add(rows.getString(1)); }
+        connection.commit();
+      } catch (SQLException error) { connection.rollback(); throw error; }
+      finally { connection.setAutoCommit(true); }
     }
     return result;
   }
