@@ -70,7 +70,8 @@ flowchart TD
 1. 保存对方广告的 TCP 端口；由于 mldht 未暴露 BEP-5 `implied_port`，UDP
    source 端口作为第二候选。
 2. 新任务以优先级 `100` 入库，并立即占用一个 metadata permit。
-3. 对最多 6 个近期 announce endpoint 发起直接连接；单次尝试最长 10 秒。
+3. 对最多 12 个近期 announce endpoint 发起直接连接；单次仍受 24 个候选和 10 秒
+   超时上限约束。
 4. 成功后立即校验、解析并写入 `content`/`file_entry`；失败只保留受限重试，
    不创建新的 DHT lookup 图。
 

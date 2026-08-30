@@ -41,7 +41,9 @@ final class DhtCollector implements AutoCloseable {
   static final int DIRECT_FALLBACK_PRIORITY = LIVE_METADATA_PRIORITY;
   static final int DIRECT_FALLBACK_DELAY_SECONDS = 5;
   static final int RECENT_LOOKUP_PRIORITY = 50;
-  static final int MAX_ANNOUNCE_ENDPOINTS = 6;
+  // Retain more recent announce endpoints so transiently bad peers do not
+  // exhaust the metadata attempt before a usable endpoint is tried.
+  static final int MAX_ANNOUNCE_ENDPOINTS = 12;
   static final int MAX_ANNOUNCED_PEER_HASHES = 50_000;
   static final int MAX_PENDING_TOUCHES = 50_000;
   // Keep intake transactions short. A larger batch makes probe_event index/page
@@ -391,7 +393,7 @@ final class DhtCollector implements AutoCloseable {
           return;
         }
         Map<String, List<InetSocketAddress>> persisted = catalog.recentPeerHints(
-            List.of(infoHash), Instant.now().minusMillis(ANNOUNCE_PEER_TTL_MS), 3);
+            List.of(infoHash), Instant.now().minusMillis(ANNOUNCE_PEER_TTL_MS), 12);
         Collection<InetSocketAddress> peers = mergePeerHints(currentAnnouncePeers(infoHash), persisted.get(infoHash));
         int timeoutSeconds = task.priority() >= LIVE_METADATA_PRIORITY
             ? liveDirectTimeoutSeconds() : liveMetadataTimeoutSeconds();
@@ -458,7 +460,7 @@ final class DhtCollector implements AutoCloseable {
       Map<String, List<InetSocketAddress>> persistedPeers;
       try {
         persistedPeers = catalog.recentPeerHints(claimed,
-            claimedAt.minusMillis(ANNOUNCE_PEER_TTL_MS), 3);
+            claimedAt.minusMillis(ANNOUNCE_PEER_TTL_MS), 12);
       } catch (Exception error) {
         persistedPeers = Map.of();
         monitor.metric("collector.failed", 1);
