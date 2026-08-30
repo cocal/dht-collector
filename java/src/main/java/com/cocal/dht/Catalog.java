@@ -535,6 +535,8 @@ final class Catalog implements AutoCloseable {
       } catch (SQLException error) {
         connection.rollback();
         throw error;
+      } finally {
+        connection.setAutoCommit(true);
       }
     }
   }
