@@ -324,7 +324,10 @@ final class Catalog implements AutoCloseable {
                 + "source_host,source_port,mode,raw_event) VALUES(?,?,?,?,?,?,?,?,?,?::jsonb) "
                 + "ON CONFLICT DO NOTHING")) {
           for (DhtObservation observation : events) {
-            if (fresh.contains(observation.infoHash())) {
+            // get_peers is discovery-only and has no endpoint. Its per-resource
+            // probe_event duplicates the resource table at very high volume;
+            // retain announce facts (which feed metadata recovery) instead.
+            if (fresh.contains(observation.infoHash()) && observation.isAnnounce()) {
               bindObservationFact(statement, "dht.resource_discovered", observation,
                   null, resourceObservationJson(observation), observation.eventId() + ":resource");
               statement.addBatch();
