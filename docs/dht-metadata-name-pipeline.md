@@ -370,3 +370,15 @@ FROM s LEFT JOIN m ON m.bucket = s.bucket;
 CPU 验收要求是长期保持约 20% 的有效利用率但不得持续满载；允许短时波动，不能以
 持续空转或持续 100% 占用作为稳定运行。服务重启后必须重新累计至少 24 小时，最近
 完整小时还必须逐分钟满足每分钟至少 2 条 metadata；不满足时不能将窗口视为完成证明。
+
+`metadata_job` 是高频重试表，历史数据会让索引可见性下降，导致即使命中索引的统计
+也变慢。应在低峰期在线维护，不要在应用事务中执行：
+
+```bash
+PGOPTIONS='-c statement_timeout=0' psql -v ON_ERROR_STOP=1 \\
+  -c "VACUUM (ANALYZE) metadata_job"
+```
+
+维护后用 `EXPLAIN` 和带 5 秒 `statement_timeout` 的 pending hot 查询复测；若查询仍
+超时，应先检查 `pg_stat_progress_vacuum`、索引膨胀和磁盘 I/O，不要直接扩大 worker
+并发。
