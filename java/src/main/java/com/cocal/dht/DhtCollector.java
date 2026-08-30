@@ -44,7 +44,9 @@ final class DhtCollector implements AutoCloseable {
   static final int MAX_ANNOUNCE_ENDPOINTS = 6;
   static final int MAX_ANNOUNCED_PEER_HASHES = 50_000;
   static final int MAX_PENDING_TOUCHES = 50_000;
-  static final int OBSERVATION_BATCH_SIZE = 256;
+  // Keep intake transactions short. A larger batch makes probe_event index/page
+  // reads hold the connection for seconds when the table is under write load.
+  static final int OBSERVATION_BATCH_SIZE = 64;
   static final long OBSERVATION_FLUSH_MILLIS = 100;
   private static final long INCOMING_NODE_PROBE_INTERVAL_NANOS =
       TimeUnit.MILLISECONDS.toNanos(250);
