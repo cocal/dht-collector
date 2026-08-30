@@ -33,6 +33,7 @@ final class Catalog implements AutoCloseable {
   private static final Pattern CREATE_INDEX_NAME = Pattern.compile("CREATE INDEX IF NOT EXISTS ([A-Za-z0-9_]+)");
   private static final int TOUCH_BATCH_SIZE = 1_000;
   private static final int RECENT_RESOURCE_CACHE_LIMIT = 50_000;
+  private static final int MAX_RECENT_LOOKUP_JOBS_PER_BATCH = 8;
   private static final String CONTENT_SEARCH_HEAD = "to_tsvector('simple', left(coalesce(c.name,'') || ' ' || coalesce(c.files_text,''), 800000))";
   private static final String CONTENT_SEARCH_TAIL = "to_tsvector('simple', substring(coalesce(c.files_text,'') from 700001 for 800000))";
   private static final String CONTENT_SEARCH_MATCH = "(" + CONTENT_SEARCH_HEAD + " @@ s.term OR (length(c.files_text) > 700000 AND " + CONTENT_SEARCH_TAIL + " @@ s.term))";
@@ -260,6 +261,9 @@ final class Catalog implements AutoCloseable {
         // the large fact table to extend or update its indexes.
         List<DhtObservation> announces = resources.stream()
             .filter(DhtObservation::isAnnounce).toList();
+        List<DhtObservation> lookupJobs = resources.stream()
+            .filter(observation -> !observation.isAnnounce())
+            .limit(MAX_RECENT_LOOKUP_JOBS_PER_BATCH).toList();
         if (!fresh.isEmpty()) {
           try (PreparedStatement statement = connection.prepareStatement(
               "INSERT INTO metadata_job(info_hash,priority,attempts,next_attempt_at,updated_at) "
@@ -273,6 +277,16 @@ final class Catalog implements AutoCloseable {
               Timestamp at = Timestamp.from(observation.observedAt());
               statement.setString(1, observation.infoHash());
               statement.setInt(2, observation.isAnnounce() ? 100 : 10);
+              statement.setInt(3, 0);
+              statement.setTimestamp(4, at);
+              statement.setTimestamp(5, at);
+              statement.setString(6, observation.infoHash());
+              statement.addBatch();
+            }
+            for (DhtObservation observation : lookupJobs) {
+              Timestamp at = Timestamp.from(observation.observedAt());
+              statement.setString(1, observation.infoHash());
+              statement.setInt(2, 50);
               statement.setInt(3, 0);
               statement.setTimestamp(4, at);
               statement.setTimestamp(5, at);

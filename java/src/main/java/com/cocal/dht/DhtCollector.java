@@ -40,6 +40,7 @@ final class DhtCollector implements AutoCloseable {
   static final int LIVE_DIRECT_TIMEOUT_SECONDS = 10;
   static final int DIRECT_FALLBACK_PRIORITY = LIVE_METADATA_PRIORITY;
   static final int DIRECT_FALLBACK_DELAY_SECONDS = 5;
+  static final int RECENT_LOOKUP_PRIORITY = 50;
   static final int MAX_ANNOUNCE_ENDPOINTS = 6;
   static final int MAX_ANNOUNCED_PEER_HASHES = 50_000;
   static final int MAX_PENDING_TOUCHES = 50_000;
@@ -59,6 +60,9 @@ final class DhtCollector implements AutoCloseable {
   private final ExecutorService tasks = Executors.newVirtualThreadPerTaskExecutor();
   private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
   private final Semaphore metadataPermits;
+  // DHT fallback builds a lookup graph, unlike direct announce peers. Keep it
+  // independently bounded so it cannot starve the direct metadata worker pool.
+  private final Semaphore hotFallbackPermits;
   private final DhtObservationQueue observationQueue;
   private final MetadataFetcher metadata;
   private final JedisPooled redis;
@@ -98,6 +102,7 @@ final class DhtCollector implements AutoCloseable {
     }
     this.observationQueue = new DhtObservationQueue(Math.max(2_048, config.maxConcurrent() * 64));
     this.metadataPermits = new Semaphore(config.metadataConcurrent());
+    this.hotFallbackPermits = new Semaphore(1);
     Files.createDirectories(config.storagePath());
     try {
       this.observationSpool = redis == null ? null : new ObservationSpool(config.storagePath().resolve("observation-spool.db"));
@@ -388,10 +393,10 @@ final class DhtCollector implements AutoCloseable {
         Collection<InetSocketAddress> peers = mergePeerHints(currentAnnouncePeers(infoHash), persisted.get(infoHash));
         int timeoutSeconds = task.priority() >= LIVE_METADATA_PRIORITY
             ? liveDirectTimeoutSeconds() : liveMetadataTimeoutSeconds();
-        var result = task.priority() >= LIVE_METADATA_PRIORITY
-            ? metadata.fetchDirect(infoHash, peers, timeoutSeconds).toCompletableFuture()
-            : metadata.fetch(infoHash, peers, timeoutSeconds).toCompletableFuture();
-        var manifest = result.get(timeoutSeconds + 5L, TimeUnit.SECONDS);
+        var manifest = task.priority() >= LIVE_METADATA_PRIORITY
+            ? fetchHotMetadata(infoHash, peers, timeoutSeconds)
+            : metadata.fetch(infoHash, peers, timeoutSeconds).toCompletableFuture()
+                .get(timeoutSeconds + 5L, TimeUnit.SECONDS);
         acknowledge = manifest.isPresent()
             ? completeMetadataSuccess(infoHash, manifest.get())
             : completeMetadataFailure(infoHash, "no metadata result");
@@ -429,9 +434,11 @@ final class DhtCollector implements AutoCloseable {
     // for a new announce while draining the large fallback queue.
     int liveCapacity = metadataPermits.availablePermits();
     if (liveCapacity > 0) launchMetadataJobs(liveCapacity, LIVE_METADATA_PRIORITY, liveMetadataTimeoutSeconds());
-    // Do not drain the historical get_peers backlog here. Those jobs have no
-    // endpoint and cause long DHT lookups to starve fresh announce work. The
-    // announce path above is the only metadata queue in single-node mode.
+    // Probe only a tiny number of newly observed get_peers resources after direct
+    // announce work. Candidate selection remains bounded to recent indexed rows.
+    int lookupCapacity = Math.min(2, metadataPermits.availablePermits());
+    if (lookupCapacity > 0) launchMetadataJobs(lookupCapacity, RECENT_LOOKUP_PRIORITY,
+        LIVE_METADATA_PRIORITY, liveMetadataTimeoutSeconds());
   }
 
   private void launchMetadataJobs(int capacity, int minimumPriority, int timeoutSeconds) throws Exception {
@@ -475,11 +482,7 @@ final class DhtCollector implements AutoCloseable {
             try {
               Collection<InetSocketAddress> preferredPeers = mergePeerHints(
                   currentAnnouncePeers(infoHash), recoveredPeers.get(infoHash));
-              // Claimed jobs are announce-hot tasks. Retrying through a DHT graph
-              // after their direct peer misses only consumes the whole worker pool;
-              // wait for a fresh announce instead.
-              metadata.fetchDirect(infoHash, preferredPeers, timeoutSeconds).toCompletableFuture()
-                  .get(timeoutSeconds + 5L, TimeUnit.SECONDS)
+              fetchMetadataByPriority(minimumPriority, infoHash, preferredPeers, timeoutSeconds)
                   .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
                       () -> completeMetadataFailure(infoHash, "no metadata result"));
             } catch (Exception error) {
@@ -500,6 +503,14 @@ final class DhtCollector implements AutoCloseable {
     } finally {
       if (remaining > 0) metadataPermits.release(remaining);
     }
+  }
+
+  private java.util.Optional<Manifest> fetchMetadataByPriority(int priority, String infoHash,
+                                                                Collection<InetSocketAddress> peers,
+                                                                int timeoutSeconds) throws Exception {
+    if (priority >= LIVE_METADATA_PRIORITY) return fetchHotMetadata(infoHash, peers, timeoutSeconds);
+    return metadata.fetch(infoHash, peers, timeoutSeconds).toCompletableFuture()
+        .get(timeoutSeconds + 5L, TimeUnit.SECONDS);
   }
 
   /**
@@ -572,8 +583,7 @@ final class DhtCollector implements AutoCloseable {
     tasks.submit(() -> {
       try {
         int timeoutSeconds = liveDirectTimeoutSeconds();
-        metadata.fetchDirect(infoHash, peers.addresses(), timeoutSeconds).toCompletableFuture()
-            .get(timeoutSeconds + 5L, TimeUnit.SECONDS)
+        fetchHotMetadata(infoHash, peers.addresses(), timeoutSeconds)
             .ifPresentOrElse(manifest -> completeDirectMetadataSuccess(infoHash, manifest),
                 () -> completeDirectMetadataMiss(infoHash, "no direct metadata result"));
       } catch (Exception error) {
@@ -593,6 +603,21 @@ final class DhtCollector implements AutoCloseable {
 
   private int liveDirectTimeoutSeconds() {
     return Math.min(LIVE_DIRECT_TIMEOUT_SECONDS, config.metadataTimeoutSeconds());
+  }
+
+  private java.util.Optional<Manifest> fetchHotMetadata(String infoHash,
+                                                         Collection<InetSocketAddress> peers,
+                                                         int timeoutSeconds) throws Exception {
+    var direct = metadata.fetchDirect(infoHash, peers, timeoutSeconds).toCompletableFuture()
+        .get(timeoutSeconds + 5L, TimeUnit.SECONDS);
+    if (direct.isPresent() || !hotFallbackPermits.tryAcquire()) return direct;
+    try {
+      monitor.metric("metadata.hot_fallback_started", 1);
+      return metadata.fetchHotFallback(infoHash, peers, timeoutSeconds).toCompletableFuture()
+          .get(timeoutSeconds + 5L, TimeUnit.SECONDS);
+    } finally {
+      hotFallbackPermits.release();
+    }
   }
 
   private Collection<InetSocketAddress> currentAnnouncePeers(String infoHash) {

@@ -111,6 +111,17 @@ final class MetadataFetcher implements AutoCloseable {
     return result;
   }
 
+  /**
+   * Resolve fresh peers through the DHT after a direct announce attempt has missed.
+   * Callers must keep this to a small global budget; it is never for backlog replay.
+   */
+  CompletionStage<Optional<Manifest>> fetchHotFallback(String infoHash,
+                                                        Collection<InetSocketAddress> preferredPeers,
+                                                        int taskTimeoutSeconds) {
+    if (taskTimeoutSeconds < 1) throw new IllegalArgumentException("metadata timeout must be positive");
+    return fetchWithDht(infoHash, preferredPeers == null ? List.of() : preferredPeers, taskTimeoutSeconds);
+  }
+
   private CompletionStage<Optional<Manifest>> fetchDirectThenDht(String infoHash,
                                                                   Collection<InetSocketAddress> preferredPeers,
                                                                   int taskTimeoutSeconds) {
@@ -143,7 +154,7 @@ final class MetadataFetcher implements AutoCloseable {
     if (closing.get()) return CompletableFuture.completedFuture(Optional.empty());
     // mldht retains killed lookup graphs for a while. Refuse new graph creation once the
     // bounded worker budget is saturated; passive discovery and DB writes remain healthy.
-    int lookupLimit = Math.max(4, maxConcurrent * 2);
+    int lookupLimit = Math.max(4, Math.min(4, maxConcurrent));
     if (activeLookups.size() >= lookupLimit) {
       metric.accept("metadata.dht_lookup_saturated", 1L);
       return CompletableFuture.completedFuture(Optional.empty());
@@ -286,7 +297,7 @@ final class MetadataFetcher implements AutoCloseable {
 
   private PeerLookupTask startPeerLookup(String infoHash, Consumer<InetSocketAddress> onPeer,
                                          Runnable onComplete) {
-    if (activeLookups.size() >= Math.max(4, maxConcurrent * 2)) {
+    if (activeLookups.size() >= Math.max(4, Math.min(4, maxConcurrent))) {
       metric.accept("metadata.dht_lookup_saturated", 1L);
       onComplete.run();
       return null;
