@@ -20,7 +20,7 @@ Mainline DHT 的 `get_peers` 和 `announce_peer` 报文本身不包含种子名�
 
 ```mermaid
 flowchart TD
-    UDP[12 个 mldht UDP 节点<br/>监听 get_peers / announce_peer]
+    UDP[8 个 mldht UDP 节点<br/>监听 get_peers / announce_peer]
     TYPE{报文类型}
     HASH[提取并规范化 v1 info-hash]
     PEER[保存 announce peer<br/>广告端口 + UDP source 端口]
@@ -31,10 +31,8 @@ flowchart TD
     JOB[(metadata_job)]
     DIRECT[立即连接 announce peer<br/>BT handshake + BEP-10 + BEP-9]
     DIRECT_OK{metadata 成功?}
-    LOOKUP[metadata fallback<br/>DHT get_peers]
-    LIB[节点 0: TorrentFetcher]
-    SHARD[节点 1..11: 独立 PeerLookupTask<br/>轮询分片]
-    CANDIDATES[合并最多 12 个 peer<br/>每批并发连接 4 个]
+    LOOKUP[历史 get_peers 任务<br/>不进入 metadata 队列]
+    CANDIDATES[合并最多 24 个 announce peer<br/>每批并发连接 4 个]
     VERIFY{SHA-1 info dictionary<br/>等于 info-hash?}
     PARSE[解析 name/name.utf-8<br/>files/path/path.utf-8]
     CONTENT[(content)]
@@ -55,12 +53,7 @@ flowchart TD
     PEER --> DIRECT
     DIRECT --> DIRECT_OK
     DIRECT_OK -->|是| VERIFY
-    DIRECT_OK -->|否，5 秒后| LOOKUP
-    JOB --> LOOKUP
-    LOOKUP --> LIB
-    LOOKUP --> SHARD
-    LIB --> CANDIDATES
-    SHARD --> CANDIDATES
+    DIRECT_OK -->|否，等待后续 announce| RETRY
     CANDIDATES --> VERIFY
     VERIFY -->|通过| PARSE
     VERIFY -->|失败或超时| RETRY
@@ -69,7 +62,6 @@ flowchart TD
     RETRY --> JOB
     UDP -.指标.-> MONITOR
     DIRECT -.指标.-> MONITOR
-    LOOKUP -.指标.-> MONITOR
     CONTENT -.指标.-> MONITOR
 ```
 
@@ -78,24 +70,23 @@ flowchart TD
 1. 保存对方广告的 TCP 端口；由于 mldht 未暴露 BEP-5 `implied_port`，UDP
    source 端口作为第二候选。
 2. 新任务以优先级 `100` 入库，并立即占用一个 metadata permit。
-3. 对最多 6 个近期 announce endpoint 发起连接；单次直接尝试最长 10 秒。
-4. 成功后立即校验、解析并写入 `content`/`file_entry`；失败则 5 秒后进入
-   DHT fallback。
+3. 对最多 6 个近期 announce endpoint 发起直接连接；单次尝试最长 10 秒。
+4. 成功后立即校验、解析并写入 `content`/`file_entry`；失败只保留受限重试，
+   不创建新的 DHT lookup 图。
 
-### 2.2 回退路径：DHT peer lookup
+### 2.2 冷任务策略
 
-1. 普通 `get_peers` 发现的任务优先级为 `10`，announce fallback 为 `100`。
-2. 节点 0 专用于 `TorrentFetcher`。该库只有在自己的 RPC task queue 为空时
-   才启动 lookup，因此不能再向节点 0 塞入独立 lookup。
-3. 独立 `PeerLookupTask` 在节点 1..11 之间轮询，避免 96 个 metadata worker
-   全部堆到一个 task manager。
-4. 找到 peer 后等待最多 500 ms 收集候选；满 12 个则提前停止 lookup。
-5. `DirectMetadataFetcher` 每批并行尝试 4 个 peer，最多尝试 12 个。
+1. `get_peers` 只用于发现资源和 DHT 路由，不自动创建 metadata 冷任务。
+2. 历史 `metadata_job` 积压不被 collector 全表回放，避免旧任务拖垮实时 announce。
+3. metadata 只从 announce_peer 提供的近期 endpoint 直接获取；失败等待新的
+   announce 或受限重试。
+4. 原有 DHT fallback 会在 mldht 内部保留 lookup 图，实测会产生
+   `metadata.dht_lookup_saturated`，因此当前生产路径关闭。
 
 ### 2.3 并发和持久化
 
 - `--max-concurrent=160`：限制 info-hash 观察处理。
-- `--metadata-concurrent=96`：限制 metadata 工作总数。
+- 生产 `--metadata-concurrent=16`：限制 metadata 工作总数。
 - Java 21 virtual threads 承载阻塞式数据库和 TCP 操作。
 - HikariCP 当前最多 5 条 PostgreSQL 连接，启用 TCP keepalive、1 分钟连接
   保活和 10 分钟最大生命周期。
@@ -332,11 +323,12 @@ flowchart LR
     WRITER -->|announce job committed| FAST[direct BEP-9 fetch]
 ```
 
-- 队列容量为 `max(2048, max-concurrent * 64)`，默认生产配置是 10,240。
+- 队列容量为 `max(2048, max-concurrent * 64)`；生产 `max-concurrent=160` 时为 10,240。
 - 相同 info-hash 在队列中合并，`announce_peer` 会升级并移动到队首。
 - 队列满时先淘汰最早的 `get_peers`；只有全部都是 announce 时才淘汰最早 announce。
 - 数据库失败时整批回队并退避 500ms，避免每个观察各自等待连接。
-- `collector.observation_queue_depth`、`collector.observation_dropped` 和
+- 观察批次为 64 条，缩短 `probe_event`/资源写入事务；
+  `collector.observation_queue_depth`、`collector.observation_dropped` 和
   `collector.observation_retry` 用于监控削峰效果。
 
 直接 Peer 获取还维护一个 `(info-hash, peer endpoint)` 短期负缓存。连接失败暂停
@@ -353,7 +345,27 @@ BEP 51 `sample_infohashes` 仍保持关闭。当前 mldht 依赖已经支持该 
 的是发现覆盖面；应先验证批量写入在至少 24 小时内没有队列增长或连接池超时，
 再考虑用一个独立 DHT 节点低速采样。
 
-2026-08-14 部署后的首个 110 秒观察窗口中，批量链路记录 1,096 个新资源并新增
-23 条 content，观察队列深度从 6 降到 2；没有 observation drop/retry、连接池
-超时或 collector failure。Peer 负缓存跳过了 183 次重复拨号。该窗口用于确认
-链路和背压行为，不替代后续 24 小时吞吐基线。
+### 6.2 当前验收口径
+
+使用以下查询验证最近完整小时的 metadata 吞吐：
+
+```sql
+WITH m AS (
+  SELECT date_trunc('minute', created_at) bucket, count(*) n
+  FROM content WHERE created_at >= now() - interval '1 hour' GROUP BY 1
+), s AS (
+  SELECT generate_series(date_trunc('minute', now()) - interval '60 minutes',
+                         date_trunc('minute', now()) - interval '1 minute',
+                         interval '1 minute') bucket
+)
+SELECT count(*) minutes,
+       count(*) FILTER (WHERE coalesce(m.n, 0) >= 2) good,
+       count(*) FILTER (WHERE coalesce(m.n, 0) < 2) bad,
+       coalesce(sum(m.n), 0) indexed
+FROM s LEFT JOIN m ON m.bucket = s.bucket;
+```
+
+同时检查 `systemctl show dht-passive-collector.service -p NRestarts -p MemoryCurrent`
+以及 `pg_stat_activity` 中是否有 `idle in transaction` 或长时间 `DataFileRead`。
+截至本次验收，服务已连续运行约 6 小时、无重启，最近小时新增 22 条 metadata，
+但只有 5 个分钟达到 2 条；吞吐目标尚未达成，不能将该窗口视为完成证明。
