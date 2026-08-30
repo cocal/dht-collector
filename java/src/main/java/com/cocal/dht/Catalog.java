@@ -26,8 +26,11 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 final class Catalog implements AutoCloseable {
+  private static final Pattern CREATE_INDEX_NAME = Pattern.compile("CREATE INDEX IF NOT EXISTS ([A-Za-z0-9_]+)");
   private static final int TOUCH_BATCH_SIZE = 1_000;
   private static final int RECENT_RESOURCE_CACHE_LIMIT = 50_000;
   private static final String CONTENT_SEARCH_HEAD = "to_tsvector('simple', left(coalesce(c.name,'') || ' ' || coalesce(c.files_text,''), 800000))";
@@ -125,6 +128,15 @@ final class Catalog implements AutoCloseable {
   }
 
   private static void createIndexIfMissing(Statement statement, String sql) throws SQLException {
+    Matcher matcher = CREATE_INDEX_NAME.matcher(sql);
+    if (!matcher.find()) throw new IllegalArgumentException("expected named CREATE INDEX statement");
+    try (PreparedStatement check = statement.getConnection().prepareStatement(
+        "SELECT 1 FROM pg_catalog.pg_indexes WHERE schemaname=current_schema() AND indexname=?")) {
+      check.setString(1, matcher.group(1));
+      try (ResultSet rows = check.executeQuery()) {
+        if (rows.next()) return;
+      }
+    }
     try {
       statement.executeUpdate(sql);
     } catch (SQLException error) {
