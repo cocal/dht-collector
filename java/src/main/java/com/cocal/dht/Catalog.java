@@ -254,7 +254,10 @@ final class Catalog implements AutoCloseable {
                   + "SELECT ?,?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) "
                   + "ON CONFLICT(info_hash) DO NOTHING")) {
             for (DhtObservation observation : resources) {
-              if (!fresh.contains(observation.infoHash())) continue;
+              // Metadata retrieval is a hot-path queue: only announce_peer has a
+              // usable endpoint, while get_peers-only resources remain discoverable
+              // without flooding the worker queue with cold jobs.
+              if (!fresh.contains(observation.infoHash()) || !observation.isAnnounce()) continue;
               Timestamp at = Timestamp.from(observation.observedAt());
               statement.setString(1, observation.infoHash());
               statement.setInt(2, observation.isAnnounce() ? 100 : 10);
