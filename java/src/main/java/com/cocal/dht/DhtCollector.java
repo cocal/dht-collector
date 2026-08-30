@@ -429,9 +429,9 @@ final class DhtCollector implements AutoCloseable {
     // for a new announce while draining the large fallback queue.
     int liveCapacity = metadataPermits.availablePermits();
     if (liveCapacity > 0) launchMetadataJobs(liveCapacity, LIVE_METADATA_PRIORITY, liveMetadataTimeoutSeconds());
-    int reservedForAnnounce = config.metadataConcurrent() > 1 ? 1 : 0;
-    int fallbackCapacity = Math.max(0, metadataPermits.availablePermits() - reservedForAnnounce);
-    if (fallbackCapacity > 0) launchMetadataJobs(fallbackCapacity, 0, LIVE_METADATA_PRIORITY, config.metadataTimeoutSeconds());
+    // Do not drain the historical get_peers backlog here. Those jobs have no
+    // endpoint and cause long DHT lookups to starve fresh announce work. The
+    // announce path above is the only metadata queue in single-node mode.
   }
 
   private void launchMetadataJobs(int capacity, int minimumPriority, int timeoutSeconds) throws Exception {
