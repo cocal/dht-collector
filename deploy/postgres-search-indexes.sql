@@ -26,6 +26,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_pending_due_idx
   ON metadata_job (priority DESC, updated_at DESC, next_attempt_at ASC, info_hash)
   WHERE status = 'pending';
 
+CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_pending_next_idx
+  ON metadata_job (next_attempt_at ASC, priority DESC, updated_at DESC, info_hash)
+  WHERE status = 'pending';
+
 CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_processing_lock_idx
   ON metadata_job (locked_until, info_hash)
   WHERE status = 'processing';
