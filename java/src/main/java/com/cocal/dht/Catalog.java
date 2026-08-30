@@ -113,6 +113,7 @@ final class Catalog implements AutoCloseable {
         createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_status_due_idx ON metadata_job (status, priority DESC, next_attempt_at ASC, updated_at DESC)");
         createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_due_idx ON metadata_job (priority DESC, next_attempt_at ASC, updated_at DESC)");
         createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_pending_next_idx ON metadata_job (next_attempt_at ASC, priority DESC, updated_at DESC, info_hash) WHERE status='pending'");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_pending_hot_idx ON metadata_job (updated_at DESC, priority DESC, next_attempt_at ASC, info_hash) WHERE status='pending'");
         createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_processing_lock_idx ON metadata_job (locked_until, info_hash) WHERE status='processing'");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS catalog_counter (name text PRIMARY KEY, value bigint NOT NULL DEFAULT 0)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS minute_metric (bucket timestamptz PRIMARY KEY, links bigint NOT NULL DEFAULT 0, queries bigint NOT NULL DEFAULT 0, failures bigint NOT NULL DEFAULT 0, warnings bigint NOT NULL DEFAULT 0, indexed bigint NOT NULL DEFAULT 0)");
@@ -552,8 +553,8 @@ final class Catalog implements AutoCloseable {
   List<Map.Entry<String, Integer>> dueMetadataJobs(int limit, Instant at) throws SQLException {
     List<Map.Entry<String, Integer>> result = new ArrayList<>();
     String sql = "WITH candidates AS (SELECT j.info_hash FROM metadata_job j "
-        + "WHERE j.status='pending' AND j.next_attempt_at <= ? "
-        + "ORDER BY j.next_attempt_at ASC,j.priority DESC,j.updated_at DESC LIMIT ?) "
+        + "WHERE j.status='pending' AND j.next_attempt_at <= ? AND j.updated_at >= ? "
+        + "ORDER BY j.updated_at DESC,j.priority DESC,j.next_attempt_at ASC LIMIT ?) "
         + "SELECT j.info_hash,j.priority FROM metadata_job j JOIN candidates c ON c.info_hash=j.info_hash "
         + "WHERE EXISTS (SELECT 1 FROM discovered_resource r "
         + "WHERE r.info_hash=j.info_hash AND r.state='active' AND r.last_seen_at >= ?) "
@@ -563,9 +564,10 @@ final class Catalog implements AutoCloseable {
       statement.setQueryTimeout(3);
       Timestamp timestamp = Timestamp.from(at);
       statement.setTimestamp(1, timestamp);
-      statement.setInt(2, Math.max(256, limit * 32));
-      statement.setTimestamp(3, Timestamp.from(at.minus(java.time.Duration.ofHours(24))));
-      statement.setInt(4, limit);
+      statement.setTimestamp(2, Timestamp.from(at.minus(java.time.Duration.ofHours(24))));
+      statement.setInt(3, Math.max(256, limit * 32));
+      statement.setTimestamp(4, Timestamp.from(at.minus(java.time.Duration.ofHours(24))));
+      statement.setInt(5, limit);
       try (ResultSet rows = statement.executeQuery()) {
         while (rows.next()) result.add(Map.entry(rows.getString(1), rows.getInt(2)));
       }
@@ -592,11 +594,11 @@ final class Catalog implements AutoCloseable {
 
   List<String> claimMetadataJobs(int limit, Instant at, int minimumPriority, int maximumPriority) throws SQLException {
     List<String> result = new ArrayList<>();
-    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("WITH candidates AS (SELECT j.info_hash FROM metadata_job j WHERE j.status='pending' AND j.next_attempt_at <= ?::timestamptz AND j.priority >= ? AND j.priority < ? ORDER BY j.next_attempt_at ASC,j.priority DESC,j.updated_at DESC LIMIT ?), due AS (SELECT j.info_hash FROM metadata_job j JOIN candidates c ON c.info_hash=j.info_hash WHERE EXISTS (SELECT 1 FROM discovered_resource r WHERE r.info_hash=j.info_hash AND r.state='active' AND r.last_seen_at >= ?::timestamptz) AND NOT EXISTS (SELECT 1 FROM content c2 WHERE c2.info_hash=j.info_hash) ORDER BY j.priority DESC,j.updated_at DESC,j.next_attempt_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT ?) UPDATE metadata_job j SET attempts=j.attempts+1,priority=0,next_attempt_at=?::timestamptz + interval '90 seconds',updated_at=?::timestamptz,status='processing',locked_by=current_setting('application_name',true),locked_until=?::timestamptz + interval '90 seconds' FROM due WHERE j.info_hash=due.info_hash RETURNING j.info_hash")) {
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement("WITH candidates AS (SELECT j.info_hash FROM metadata_job j WHERE j.status='pending' AND j.next_attempt_at <= ?::timestamptz AND j.priority >= ? AND j.priority < ? AND j.updated_at >= ?::timestamptz ORDER BY j.updated_at DESC,j.priority DESC,j.next_attempt_at ASC LIMIT ?), due AS (SELECT j.info_hash FROM metadata_job j JOIN candidates c ON c.info_hash=j.info_hash WHERE EXISTS (SELECT 1 FROM discovered_resource r WHERE r.info_hash=j.info_hash AND r.state='active' AND r.last_seen_at >= ?::timestamptz) AND NOT EXISTS (SELECT 1 FROM content c2 WHERE c2.info_hash=j.info_hash) ORDER BY j.priority DESC,j.updated_at DESC,j.next_attempt_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT ?) UPDATE metadata_job j SET attempts=j.attempts+1,priority=0,next_attempt_at=?::timestamptz + interval '90 seconds',updated_at=?::timestamptz,status='processing',locked_by=current_setting('application_name',true),locked_until=?::timestamptz + interval '90 seconds' FROM due WHERE j.info_hash=due.info_hash RETURNING j.info_hash")) {
       connection.setAutoCommit(false);
       try {
         statement.setQueryTimeout(5);
-        Timestamp timestamp = Timestamp.from(at); Timestamp recent = Timestamp.from(at.minus(java.time.Duration.ofHours(24))); statement.setTimestamp(1, timestamp); statement.setInt(2, minimumPriority); statement.setInt(3, maximumPriority); statement.setInt(4, Math.max(256, limit * 32)); statement.setTimestamp(5, recent); statement.setInt(6, limit); statement.setTimestamp(7, timestamp); statement.setTimestamp(8, timestamp); statement.setTimestamp(9, timestamp);
+        Timestamp timestamp = Timestamp.from(at); Timestamp recent = Timestamp.from(at.minus(java.time.Duration.ofHours(24))); statement.setTimestamp(1, timestamp); statement.setInt(2, minimumPriority); statement.setInt(3, maximumPriority); statement.setTimestamp(4, recent); statement.setInt(5, Math.max(256, limit * 32)); statement.setTimestamp(6, recent); statement.setInt(7, limit); statement.setTimestamp(8, timestamp); statement.setTimestamp(9, timestamp); statement.setTimestamp(10, timestamp);
         try (ResultSet rows = statement.executeQuery()) { while (rows.next()) result.add(rows.getString(1)); }
         connection.commit();
       } catch (SQLException error) { connection.rollback(); throw error; }
