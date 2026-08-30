@@ -475,7 +475,10 @@ final class DhtCollector implements AutoCloseable {
             try {
               Collection<InetSocketAddress> preferredPeers = mergePeerHints(
                   currentAnnouncePeers(infoHash), recoveredPeers.get(infoHash));
-              metadata.fetch(infoHash, preferredPeers, timeoutSeconds).toCompletableFuture()
+              // Claimed jobs are announce-hot tasks. Retrying through a DHT graph
+              // after their direct peer misses only consumes the whole worker pool;
+              // wait for a fresh announce instead.
+              metadata.fetchDirect(infoHash, preferredPeers, timeoutSeconds).toCompletableFuture()
                   .get(timeoutSeconds + 5L, TimeUnit.SECONDS)
                   .ifPresentOrElse(manifest -> completeMetadataSuccess(infoHash, manifest),
                       () -> completeMetadataFailure(infoHash, "no metadata result"));
