@@ -37,7 +37,9 @@ final class DirectMetadataFetcher implements AutoCloseable {
   private static final int PIECE_SIZE = 16 * 1024;
   private static final int MAX_METADATA_BYTES = MetadataFetcher.MAX_METADATA_BYTES;
   private static final int MAX_FRAME_BYTES = MAX_METADATA_BYTES + 64 * 1024;
-  static final int MAX_PEERS_PER_FETCH = 12;
+  // Keep the first wave small, but retain a wider fallback window so a bad
+  // announce peer does not consume the whole metadata attempt.
+  static final int MAX_PEERS_PER_FETCH = 24;
   private static final int PEER_BATCH_SIZE = 4;
   private static final int DEFAULT_CONNECT_TIMEOUT_MILLIS = 3_000;
   private static final int HEDGED_CONNECT_TIMEOUT_MILLIS = 1_500;
@@ -63,6 +65,7 @@ final class DirectMetadataFetcher implements AutoCloseable {
   private final SecureRandom random = new SecureRandom();
   private final Set<Socket> activeSockets = java.util.concurrent.ConcurrentHashMap.newKeySet();
   private final PeerPenaltyCache penalties = new PeerPenaltyCache();
+  private final PeerScoreCache scores = new PeerScoreCache();
   private final BiConsumer<String, Long> metric;
 
   DirectMetadataFetcher() { this((ignored, value) -> { }); }
@@ -78,7 +81,9 @@ final class DirectMetadataFetcher implements AutoCloseable {
         .distinct().limit(MAX_PEERS_PER_FETCH).toList();
     long nowMillis = System.currentTimeMillis();
     List<InetSocketAddress> candidates = supplied.stream()
-        .filter(peer -> !penalties.isPenalized(infoHash, peer, nowMillis)).toList();
+        .filter(peer -> !penalties.isPenalized(infoHash, peer, nowMillis))
+        .sorted((left, right) -> Integer.compare(scores.score(right), scores.score(left)))
+        .toList();
     int skipped = supplied.size() - candidates.size();
     if (skipped > 0) metric.accept("metadata.peer.penalty_skipped", (long) skipped);
     if (candidates.isEmpty()) return CompletableFuture.completedFuture(Optional.empty());
@@ -120,6 +125,7 @@ final class DirectMetadataFetcher implements AutoCloseable {
           byte[] metadata = fetchPeer(infoHash, peer, deadline, connectTimeoutMillis, fetchSockets);
           if (metadata != null) {
             penalties.clear(infoHash, peer);
+            scores.success(peer);
             metric.accept("metadata.peer.completed", 1L);
             if (result.complete(Optional.of(metadata))) closeSockets(fetchSockets);
           }
@@ -271,6 +277,7 @@ final class DirectMetadataFetcher implements AutoCloseable {
     PeerFetchException failure = error instanceof PeerFetchException peerError
         ? peerError : classify(Stage.METADATA, error);
     penalties.penalize(infoHash, peer, System.currentTimeMillis(), failure.penaltyMillis);
+    scores.failure(peer);
     metric.accept("metadata.peer." + failure.reason, 1L);
   }
 
