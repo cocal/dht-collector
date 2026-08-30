@@ -367,5 +367,6 @@ FROM s LEFT JOIN m ON m.bucket = s.bucket;
 
 同时检查 `systemctl show dht-passive-collector.service -p NRestarts -p MemoryCurrent`
 以及 `pg_stat_activity` 中是否有 `idle in transaction` 或长时间 `DataFileRead`。
-截至本次验收，服务已连续运行约 6 小时、无重启，最近小时新增 22 条 metadata，
-但只有 5 个分钟达到 2 条；吞吐目标尚未达成，不能将该窗口视为完成证明。
+CPU 验收要求是长期保持约 20% 的有效利用率但不得持续满载；允许短时波动，不能以
+持续空转或持续 100% 占用作为稳定运行。服务重启后必须重新累计至少 24 小时，最近
+完整小时还必须逐分钟满足每分钟至少 2 条 metadata；不满足时不能将窗口视为完成证明。
