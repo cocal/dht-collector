@@ -610,7 +610,19 @@ final class Catalog implements AutoCloseable {
       connection.setAutoCommit(false);
       Timestamp timestamp = Timestamp.from(at);
       statement.setTimestamp(1, timestamp); statement.setTimestamp(2, timestamp); statement.setTimestamp(3, timestamp); statement.setString(4, hash); statement.setTimestamp(5, timestamp); statement.setTimestamp(6, timestamp);
-      try (ResultSet rows = statement.executeQuery()) { boolean claimed = rows.next(); connection.commit(); return claimed; }
+      try {
+        statement.setQueryTimeout(5);
+        try (ResultSet rows = statement.executeQuery()) {
+          boolean claimed = rows.next();
+          connection.commit();
+          return claimed;
+        }
+      } catch (SQLException error) {
+        connection.rollback();
+        throw error;
+      } finally {
+        connection.setAutoCommit(true);
+      }
     }
   }
 
