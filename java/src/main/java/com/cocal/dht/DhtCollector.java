@@ -614,8 +614,8 @@ final class DhtCollector implements AutoCloseable {
                                                          int timeoutSeconds) throws Exception {
     var direct = metadata.fetchDirect(infoHash, peers, timeoutSeconds).toCompletableFuture()
         .get(timeoutSeconds + 5L, TimeUnit.SECONDS);
-    // A DHT graph is deliberately disabled for the passive collector. mldht keeps
-    // graph tasks beyond the request deadline; replaying them causes saturation.
+    // Keep mldht graph fallback disabled for the passive collector. Its lookup
+    // tasks outlive request deadlines and quickly saturate the task manager.
     return direct;
   }
 
