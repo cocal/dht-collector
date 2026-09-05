@@ -31,6 +31,8 @@ flowchart TD
     JOB[(metadata_job)]
     DIRECT[立即连接 announce peer<br/>BT handshake + BEP-10 + BEP-9]
     DIRECT_OK{metadata 成功?}
+    EXPLORE[(peer_exploration_job)]
+    WORKER[独立 Node peer explorer\n可取消 DHT lookup]
     LOOKUP[历史 get_peers 任务<br/>不进入 metadata 队列]
     CANDIDATES[合并最多 24 个 announce peer<br/>每批并发连接 4 个]
     VERIFY{SHA-1 info dictionary<br/>等于 info-hash?}
@@ -53,7 +55,8 @@ flowchart TD
     PEER --> DIRECT
     DIRECT --> DIRECT_OK
     DIRECT_OK -->|是| VERIFY
-    DIRECT_OK -->|否，等待后续 announce| RETRY
+    DIRECT_OK -->|否| EXPLORE --> WORKER --> EVENT
+    EVENT -->|新 peer 唤醒 pending job| RETRY
     CANDIDATES --> VERIFY
     VERIFY -->|通过| PARSE
     VERIFY -->|失败或超时| RETRY
@@ -82,7 +85,14 @@ flowchart TD
 3. metadata 只从 announce_peer 提供的近期 endpoint 直接获取；失败等待新的
    announce 或受限重试。
 4. 原有 DHT fallback 会在 mldht 内部保留 lookup 图，实测会产生
-   `metadata.dht_lookup_saturated`，因此当前生产路径关闭。
+   `metadata.dht_lookup_saturated`，因此主进程不再运行它。
+5. 直连未命中会写入独立的 `peer_exploration_job`。Node worker 使用
+   `bittorrent-dht` 的可取消 lookup，最多四个并发、每项 5 秒；主 collector
+   每 1.5 秒至多投递一项，空结果会删除任务而不重试，因此该表不会积压为历史表。
+   worker 只写回
+   `dht.peer_discovered` 事实并唤醒 pending metadata job，不能领取或写入
+   metadata_job/content。worker 受 systemd `CPUQuota=25%`、`MemoryMax=400M`
+   约束，异常重启不会拖垮主 collector。
 
 ### 2.3 并发和持久化
 
@@ -393,3 +403,26 @@ install -m 0644 deploy/dht-metadata-maintenance.{service,timer} /etc/systemd/sys
 systemctl daemon-reload
 systemctl enable --now dht-metadata-maintenance.timer
 ```
+
+### 6.3 隔离 Peer Explorer
+
+`dht-peer-explorer.service` 是主 collector 的可选补充，不接管 UDP 入站、
+metadata 领取或内容写入。它只在直连 miss 后领取 `peer_exploration_job`，以
+`bittorrent-dht` 查找额外 peer 并写回 `dht.peer_discovered`。查找没有 peer 时
+立即删除该临时任务；主 collector 每 1.5 秒最多投递一个，因此不能累积成全表扫描。
+
+部署文件已固定资源和连接预算：collector 4 条连接、dashboard 1 条、monitor 1 条、
+explorer 1 条；explorer 受 `CPUQuota=25%`、`MemoryMax=400M` 限制。安装或升级：
+
+```bash
+install -m 0644 deploy/dht-passive-collector-java.conf /etc/systemd/system/dht-passive-collector.service.d/java.conf
+install -m 0644 deploy/dht-peer-explorer.service /etc/systemd/system/
+install -m 0755 scripts/dht-self-check.sh /usr/local/sbin/
+systemctl daemon-reload
+systemctl restart dht-passive-collector.service
+systemctl enable --now dht-peer-explorer.service
+```
+
+用 `systemctl show dht-passive-collector.service dht-peer-explorer.service -p NRestarts -p MemoryCurrent -p CPUUsageNSec`
+检查两个进程。`peer_exploration_job` 应保持很小且短暂；若需要检查，先暂停 worker
+腾出角色连接余量，再用带 3 秒 `statement_timeout` 的只读查询，禁止对高频主表执行无界统计。

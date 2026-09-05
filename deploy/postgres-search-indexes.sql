@@ -38,6 +38,26 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS metadata_job_processing_lock_idx
   ON metadata_job (locked_until, info_hash)
   WHERE status = 'processing';
 
+-- Independent, short-lived DHT peer lookups. This queue never competes with
+-- metadata_job leases, so its worker can be restarted independently.
+CREATE TABLE IF NOT EXISTS peer_exploration_job (
+  info_hash text PRIMARY KEY,
+  priority integer NOT NULL DEFAULT 100,
+  attempts integer NOT NULL DEFAULT 0,
+  next_attempt_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  locked_by text,
+  locked_until timestamptz,
+  last_error text
+);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS peer_exploration_pending_idx
+  ON peer_exploration_job (priority DESC, next_attempt_at ASC, updated_at DESC, info_hash)
+  WHERE status = 'pending';
+CREATE INDEX CONCURRENTLY IF NOT EXISTS peer_exploration_processing_idx
+  ON peer_exploration_job (locked_until, info_hash)
+  WHERE status = 'processing';
+
 -- Recover short-lived announce peer hints without scanning unrelated probe events.
 CREATE INDEX CONCURRENTLY IF NOT EXISTS probe_event_recent_peer_idx
   ON probe_event (info_hash, occurred_at DESC)

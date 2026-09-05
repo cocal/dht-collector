@@ -41,6 +41,7 @@ if ! systemctl is-active --quiet keydb.service || ! timeout 3s keydb-cli ping 2>
   restart_unit keydb.service
 fi
 ensure_active dht-passive-collector.service
+ensure_active dht-peer-explorer.service
 ensure_active dht-monitor-ingest.service
 ensure_active dht-redis-monitor.service
 

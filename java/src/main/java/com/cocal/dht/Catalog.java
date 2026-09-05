@@ -119,6 +119,12 @@ final class Catalog implements AutoCloseable {
         createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_pending_next_idx ON metadata_job (next_attempt_at ASC, priority DESC, updated_at DESC, info_hash) WHERE status='pending'");
         createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_pending_hot_idx ON metadata_job (updated_at DESC, priority DESC, next_attempt_at ASC, info_hash) WHERE status='pending'");
         createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS metadata_job_processing_lock_idx ON metadata_job (locked_until, info_hash) WHERE status='processing'");
+        // DHT peer discovery is intentionally separate from metadata_job.  The
+        // isolated Node worker only writes peer facts; the collector remains the
+        // sole owner of metadata task claims and manifest writes.
+        statement.executeUpdate("CREATE TABLE IF NOT EXISTS peer_exploration_job (info_hash text PRIMARY KEY, priority integer NOT NULL DEFAULT 100, attempts integer NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, status text NOT NULL DEFAULT 'pending', locked_by text, locked_until timestamptz, last_error text)");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS peer_exploration_pending_idx ON peer_exploration_job (priority DESC, next_attempt_at ASC, updated_at DESC, info_hash) WHERE status='pending'");
+        createIndexIfMissing(statement, "CREATE INDEX IF NOT EXISTS peer_exploration_processing_idx ON peer_exploration_job (locked_until, info_hash) WHERE status='processing'");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS catalog_counter (name text PRIMARY KEY, value bigint NOT NULL DEFAULT 0)");
         statement.executeUpdate("CREATE TABLE IF NOT EXISTS minute_metric (bucket timestamptz PRIMARY KEY, links bigint NOT NULL DEFAULT 0, queries bigint NOT NULL DEFAULT 0, failures bigint NOT NULL DEFAULT 0, warnings bigint NOT NULL DEFAULT 0, indexed bigint NOT NULL DEFAULT 0)");
         addColumnIfMissing(connection, statement, "minute_metric", "indexed", "bigint NOT NULL DEFAULT 0");
@@ -549,6 +555,39 @@ final class Catalog implements AutoCloseable {
         statement.setString(1, hash); statement.setInt(2, priority); statement.setInt(3, 0); statement.setTimestamp(4, Timestamp.from(at)); statement.setTimestamp(5, Timestamp.from(at)); statement.setString(6, hash); statement.setBoolean(7, accelerate); boolean changed = statement.executeUpdate() > 0; connection.commit(); return changed;
       } catch (SQLException error) { connection.rollback(); throw error; }
       finally { connection.setAutoCommit(true); }
+    }
+  }
+
+  /**
+   * Schedule an isolated, bounded DHT peer lookup after a live direct fetch
+   * missed.  This table is deliberately independent from metadata_job so a
+   * lookup worker cannot take or release a metadata lease.
+   */
+  boolean queuePeerExplorationJob(String hash, Instant at, int priority) throws SQLException {
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement(
+        "INSERT INTO peer_exploration_job(info_hash,priority,attempts,next_attempt_at,updated_at,status) "
+            + "SELECT ?,?,0,?,?,'pending' WHERE NOT EXISTS (SELECT 1 FROM content WHERE info_hash=?) "
+            + "ON CONFLICT(info_hash) DO UPDATE SET priority=greatest(peer_exploration_job.priority,excluded.priority),"
+            + "next_attempt_at=least(peer_exploration_job.next_attempt_at,excluded.next_attempt_at),"
+            + "updated_at=excluded.updated_at,status=CASE WHEN peer_exploration_job.status='processing' THEN 'processing' ELSE 'pending' END,last_error=NULL")) {
+      statement.setQueryTimeout(5);
+      statement.setString(1, hash); statement.setInt(2, priority);
+      statement.setTimestamp(3, Timestamp.from(at)); statement.setTimestamp(4, Timestamp.from(at));
+      statement.setString(5, hash);
+      return statement.executeUpdate() > 0;
+    }
+  }
+
+  /** Release a failed direct attempt while the isolated peer explorer runs. */
+  void awaitPeerExploration(String hash, Instant at) throws SQLException {
+    try (Connection connection = dataSource.getConnection(); PreparedStatement statement = connection.prepareStatement(
+        "UPDATE metadata_job SET priority=greatest(priority,100),status='pending',locked_by=NULL,locked_until=NULL,"
+            + "next_attempt_at=?::timestamptz + interval '45 seconds',updated_at=?::timestamptz "
+            + "WHERE info_hash=?")) {
+      statement.setQueryTimeout(5);
+      statement.setTimestamp(1, Timestamp.from(at)); statement.setTimestamp(2, Timestamp.from(at));
+      statement.setString(3, hash);
+      statement.executeUpdate();
     }
   }
 

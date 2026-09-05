@@ -52,6 +52,11 @@ final class DhtCollector implements AutoCloseable {
   static final long OBSERVATION_FLUSH_MILLIS = 100;
   private static final long INCOMING_NODE_PROBE_INTERVAL_NANOS =
       TimeUnit.MILLISECONDS.toNanos(250);
+  // The isolated peer explorer has four bounded 5-second lookups. Keep intake
+  // below its worst-case completion rate so its temporary queue never becomes
+  // a second unbounded history table during a noisy announce burst.
+  private static final long PEER_EXPLORATION_INTERVAL_NANOS =
+      TimeUnit.MILLISECONDS.toNanos(1_500);
 
   private record PeerHint(InetSocketAddress address, long observedAt, long sequence) {}
   private record PeerSnapshot(List<InetSocketAddress> addresses, long sequence) {}
@@ -80,6 +85,7 @@ final class DhtCollector implements AutoCloseable {
   private final Map<String, LongAdder> queryCounts = new ConcurrentHashMap<>();
   private final Map<DHT, AtomicLong> incomingNodeProbeGates = new ConcurrentHashMap<>();
   private final AtomicLong peerSequence = new AtomicLong();
+  private final AtomicLong nextPeerExplorationNanos = new AtomicLong();
   private final AtomicBoolean metadataRecoveryRunning = new AtomicBoolean();
   private final AtomicLong metadataRecoveryAttemptNanos = new AtomicLong();
   private final AtomicLong discovered;
@@ -739,8 +745,16 @@ final class DhtCollector implements AutoCloseable {
 
   private boolean completeDirectMetadataMiss(String infoHash, String message) {
     try {
-      catalog.queueMetadataJob(infoHash, Instant.now().plusSeconds(DIRECT_FALLBACK_DELAY_SECONDS),
-          DIRECT_FALLBACK_PRIORITY, true);
+      // mldht lookup fallback is deliberately not used here.  The Node peer
+      // explorer has a cancellable lookup API and is cgroup-isolated from this
+      // process.  It only adds peer facts; this collector still owns metadata.
+      Instant now = Instant.now();
+      if (reservePeerExplorationSlot()) {
+        catalog.queuePeerExplorationJob(infoHash, now, LIVE_METADATA_PRIORITY);
+      }
+      // Do not repeatedly redial the same announce peer while an explorer is
+      // collecting alternatives. A successful lookup wakes this pending job.
+      catalog.awaitPeerExploration(infoHash, now);
       monitor.metric("metadata.direct_miss", 1);
       catalog.event("metadata.direct_miss", infoHash,
           "{\"event\":\"metadata.direct_miss\",\"info_hash\":\"" + infoHash
@@ -750,6 +764,17 @@ final class DhtCollector implements AutoCloseable {
       monitor.metric("collector.failed", 1);
       System.err.println("direct metadata retry persistence failed: " + error.getMessage());
       return false;
+    }
+  }
+
+  private boolean reservePeerExplorationSlot() {
+    long now = System.nanoTime();
+    while (true) {
+      long availableAt = nextPeerExplorationNanos.get();
+      if (now < availableAt) return false;
+      if (nextPeerExplorationNanos.compareAndSet(availableAt, now + PEER_EXPLORATION_INTERVAL_NANOS)) {
+        return true;
+      }
     }
   }
 

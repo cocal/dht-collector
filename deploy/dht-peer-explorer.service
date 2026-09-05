@@ -1,0 +1,23 @@
+[Unit]
+Description=Isolated DHT peer exploration worker
+After=network-online.target dht-passive-collector.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/vibe/dht-collector
+EnvironmentFile=/root/.config/dht-search/db.env
+ExecStart=/usr/bin/node src/peer-explorer.js --port 51431 --dht-nodes 4 --concurrency 4 --lookup-timeout-ms 5000 --max-peers 8
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=32768
+CPUQuota=25%
+MemoryHigh=320M
+MemoryMax=400M
+OOMPolicy=stop
+
+[Install]
+WantedBy=multi-user.target

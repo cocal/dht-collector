@@ -13,10 +13,11 @@
     "catalog": "node src/catalog.js",
     "approved-index": "node src/approved-indexer.js",
     "passive-collector": "node src/passive-collector.js",
+    "peer-explorer": "node src/peer-explorer.js",
     "import-torrent": "node src/authorized-torrent-import.js",
     "dashboard": "node web/server.js",
     "migrate:postgres": "node scripts/migrate-sqlite-to-postgres.js",
-    "check": "node --check src/index.js && node --check src/approved-indexer.js && node --check src/passive-collector.js && node --check src/authorized-torrent-import.js && node --check src/metadata-fetcher.js && node --check src/catalog.js && node --check src/event-utils.js && node --check src/postgres-catalog.js && node --check src/storage.js && node --check scripts/migrate-sqlite-to-postgres.js && node --check web/server.js && node --check web/public/app.js",
+    "check": "node --check src/index.js && node --check src/approved-indexer.js && node --check src/passive-collector.js && node --check src/peer-explorer.js && node --check src/authorized-torrent-import.js && node --check src/metadata-fetcher.js && node --check src/catalog.js && node --check src/event-utils.js && node --check src/postgres-catalog.js && node --check src/storage.js && node --check scripts/migrate-sqlite-to-postgres.js && node --check web/server.js && node --check web/public/app.js",
     "test": "node --test"
   },
   "dependencies": {
